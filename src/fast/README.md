@@ -45,7 +45,21 @@ through `notifyMemoryWrites`. The sink updates every resident target intersectin
 those records, including same-value stores, without modifying earlier snapshots.
 Flush earlier work before delivering writes at graphics task/readback/presentation
 boundaries. RAM comparison remains a fallback for writes that were not reported.
-Overlapping GPU framebuffer aliases still require further work.
+Overlapping RGBA16/32 color images retain separate address, dimension and format
+views. A GPU copy merges overlapping N64 bytes in draw order, including changed
+row widths and partial pixels, without a CPU readback. View retirement preserves
+a complete backing image for later reads and snapshots; the cache consolidates
+containing views before dropping their smaller representations. Complete CPU
+overwrites release the corresponding GPU-owned byte ranges so ordinary texture
+loads can return to RAM. A snapshot/read still requires one retained view to
+contain the requested range.
+
+Host regressions cover odd byte addresses, addresses above 16 MiB, format and
+stride changes, CPU writes, immutable snapshots and cache pressure. The native
+Vita3K/Vulkan diagnostic also preserves overlapping red/blue/green images through
+an RGBA16-to-RGBA32-to-RGBA16 round trip. Byte selection uses arithmetic masks:
+chained early returns selected the wrong third byte on the tested Vita shader
+compilation path, even though the same GLSL passed the host checks.
 
 Color storage is independent of depth surfaces. Draws with the same depth address
 and dimensions share one persistent depth FBO, switching its color attachment as

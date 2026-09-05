@@ -59,7 +59,9 @@ namespace {
     void enabled(GLenum cap, bool value) { if (value) glEnable(cap); else glDisable(cap); }
     struct Target {
         GLuint fbo=0,texture=0;
+        uint32_t address=0;
         uint32_t width=0,height=0,colorBytes=2;
+        uint64_t writeVersion=0,syncVersion=0,lastDraw=0;
         std::weak_ptr<const FastFramebuffer> snapshot;
         uint64_t memoryEpoch=0;
         uint32_t shadowAddress=0;
@@ -117,7 +119,12 @@ namespace {
         // before generating GLSL; doing string generation for every triangle is
         // particularly expensive on the Vita CPU.
         using ShaderKey=std::array<uint32_t,4>;
-        std::map<uint32_t, Target> targets;
+        using ColorKey=std::tuple<uint32_t,uint32_t,uint32_t,uint32_t>;
+        std::map<ColorKey, Target> targets;
+        uint64_t contentVersion=0;
+        // Conservative GPU-owned byte ranges. Complete CPU overwrites can use
+        // ordinary TMEM loads even while an old framebuffer view remains cached.
+        std::map<uint64_t,uint64_t> gpuRanges;
         using DepthKey=std::tuple<uint32_t,uint32_t,uint32_t>; // Address, width, height.
         std::map<DepthKey,DepthTarget> depthTargets;
         std::shared_ptr<ImagePool> imagePool=std::make_shared<ImagePool>();
@@ -132,9 +139,204 @@ namespace {
         GLint blitGamma=-1,blitQuantize=-1;
         GLuint memoryMerge=0,memoryPixels=0,memoryMask=0;
         GLuint depthClearProgram=0;
+        GLuint aliasProgram=0;
+        GLint aliasDestination=-1,aliasSource=-1,aliasOffset=-1,aliasBounds=-1;
         GLint memoryColorBytes=-1;
         std::function<void()> swapBuffers;
         std::function<void(uint32_t,uint32_t,bool)> watchMemory;
+
+        static uint64_t endAddress(const Target &t) { return uint64_t(t.address)+uint64_t(t.width)*t.height*t.colorBytes; }
+        bool hasGpuBytes(uint64_t begin,uint64_t end) const {
+            auto it=gpuRanges.upper_bound(begin);
+            if(it!=gpuRanges.begin() && std::prev(it)->second>begin) return true;
+            return it!=gpuRanges.end() && it->first<end;
+        }
+        void markGpuBytes(uint64_t begin,uint64_t end) {
+            if(begin>=end) return;
+            auto it=gpuRanges.lower_bound(begin);
+            if(it!=gpuRanges.begin()) {
+                auto previous=std::prev(it);
+                if(previous->second>=end) return;
+                if(previous->second>=begin) { begin=previous->first; it=gpuRanges.erase(previous); }
+            }
+            while(it!=gpuRanges.end() && it->first<=end) { end=std::max(end,it->second); it=gpuRanges.erase(it); }
+            gpuRanges.emplace(begin,end);
+        }
+        void clearGpuBytes(uint64_t begin,uint64_t end) {
+            auto it=gpuRanges.lower_bound(begin);
+            if(it!=gpuRanges.begin() && std::prev(it)->second>begin) --it;
+            while(it!=gpuRanges.end() && it->first<end) {
+                const auto old=*it; it=gpuRanges.erase(it);
+                if(old.first<begin) gpuRanges.emplace(old.first,begin);
+                if(old.second>end) { gpuRanges.emplace(end,old.second); break; }
+            }
+        }
+        void markDrawnBytes(const FastDraw &draw) {
+            if(draw.vertices.empty()) return;
+            auto bounds=scissorBounds(draw,draw.fill||draw.rectangle);
+            bounds[0]=std::clamp(bounds[0],0,int(draw.width)); bounds[2]=std::clamp(bounds[2],0,int(draw.width));
+            bounds[1]=std::clamp(bounds[1],0,int(draw.height)); bounds[3]=std::clamp(bounds[3],0,int(draw.height));
+            if(bounds[0]>=bounds[2] || bounds[1]>=bounds[3]) return;
+            const uint64_t stride=uint64_t(draw.width)*draw.colorBytes;
+            if(!bounds[0] && bounds[2]==int(draw.width)) {
+                markGpuBytes(draw.colorAddress+bounds[1]*stride,draw.colorAddress+bounds[3]*stride);
+            } else for(int y=bounds[1];y<bounds[3];++y) {
+                const uint64_t row=draw.colorAddress+y*stride;
+                markGpuBytes(row+bounds[0]*draw.colorBytes,row+bounds[2]*draw.colorBytes);
+            }
+        }
+        Target *findTarget(uint32_t address,uint32_t size,uint32_t width=0) {
+            Target *best=nullptr;
+            for(auto &entry:targets) {
+                auto &t=entry.second;
+                if(!t.fbo || address<t.address || uint64_t(address)+size>endAddress(t)) continue;
+                const bool matches=width && t.width==width,oldMatches=best && width && best->width==width;
+                if(!best || (matches && !oldMatches) || (matches==oldMatches && t.lastDraw>best->lastDraw)) best=&t;
+            }
+            return best;
+        }
+        void copyAlias(Target &destination,const Target &source) {
+            const uint64_t begin=std::max(destination.address,source.address);
+            const uint64_t end=std::min(endAddress(destination),endAddress(source));
+            if(begin>=end) return;
+            if(!aliasProgram) {
+                aliasProgram=link(vertexShader,R"(#version 100
+precision highp float;
+varying vec2 vUV;
+uniform sampler2D uOld, uSource;
+uniform vec3 uDestinationSize, uSourceSize;
+uniform float uOffset;
+uniform vec2 uBounds;
+vec4 bytesOf(vec4 color, float size) {
+    vec4 bytes = floor(color*255.0+0.5);
+    if (size < 3.0) {
+        vec3 bits = floor(bytes.rgb/8.0);
+        float greenHigh = floor(bits.g/4.0);
+        bytes = vec4(bits.r*8.0+greenHigh,(bits.g-greenHigh*4.0)*64.0+bits.b*2.0+step(128.0,bytes.a),0.0,0.0);
+    }
+    return bytes;
+}
+float sourceByte(float at) {
+    float relative = at + uOffset;
+    float pixel = floor(relative/uSourceSize.z);
+    float pixelY = floor(pixel/uSourceSize.x);
+    float pixelX = pixel-pixelY*uSourceSize.x;
+    vec4 bytes = bytesOf(texture2D(uSource,vec2((pixelX+0.5)/uSourceSize.x,1.0-(pixelY+0.5)/uSourceSize.y)),uSourceSize.z);
+    float lane = relative-pixel*uSourceSize.z;
+    // Keep every sampled channel live: chained early returns selected the
+    // wrong third byte on the tested Vita shader compilation path.
+    vec4 selectByte = vec4(1.0)-step(vec4(0.5),abs(vec4(lane)-vec4(0.0,1.0,2.0,3.0)));
+    return dot(bytes,selectByte);
+}
+void main() {
+    vec2 pixel = floor(vUV*uDestinationSize.xy);
+    float at = ((uDestinationSize.y-1.0-pixel.y)*uDestinationSize.x+pixel.x)*uDestinationSize.z;
+    vec4 bytes = bytesOf(texture2D(uOld,vUV),uDestinationSize.z);
+    if (at >= uBounds.x && at < uBounds.y) bytes.r = sourceByte(at);
+    if (at+1.0 >= uBounds.x && at+1.0 < uBounds.y) bytes.g = sourceByte(at+1.0);
+    if (uDestinationSize.z > 3.0) {
+        if (at+2.0 >= uBounds.x && at+2.0 < uBounds.y) bytes.b = sourceByte(at+2.0);
+        if (at+3.0 >= uBounds.x && at+3.0 < uBounds.y) bytes.a = sourceByte(at+3.0);
+        gl_FragColor = bytes/255.0;
+    } else {
+        float red = floor(bytes.r/8.0), greenLow = floor(bytes.g/64.0);
+        vec3 bits = vec3(red,(bytes.r-red*8.0)*4.0+greenLow,floor(bytes.g/2.0)-greenLow*32.0);
+        gl_FragColor = vec4((bits*8.0+floor(bits/4.0))/255.0,bytes.g-floor(bytes.g/2.0)*2.0);
+    }
+}
+)");
+                glUseProgram(aliasProgram);
+                glUniform1i(glGetUniformLocation(aliasProgram,"uOld"),0);
+                glUniform1i(glGetUniformLocation(aliasProgram,"uSource"),1);
+                aliasDestination=glGetUniformLocation(aliasProgram,"uDestinationSize");
+                aliasSource=glGetUniformLocation(aliasProgram,"uSourceSize");
+                aliasOffset=glGetUniformLocation(aliasProgram,"uOffset");
+                aliasBounds=glGetUniformLocation(aliasProgram,"uBounds");
+            }
+            glActiveTexture(GL_TEXTURE0);
+            if(!destination.memoryScratch) {
+                glGenTextures(1,&destination.memoryScratch); glBindTexture(GL_TEXTURE_2D,destination.memoryScratch);
+                glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,destination.width,destination.height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER,destination.fbo);
+            glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,destination.memoryScratch,0);
+            glBindTexture(GL_TEXTURE_2D,destination.texture);
+            glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D,source.texture);
+            glViewport(0,0,destination.width,destination.height);
+            glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE);
+            glDisable(GL_BLEND); glDisable(GL_POLYGON_OFFSET_FILL);
+            glUseProgram(aliasProgram);
+            glUniform3f(aliasDestination,destination.width,destination.height,destination.colorBytes);
+            glUniform3f(aliasSource,source.width,source.height,source.colorBytes);
+            // Relative offsets keep byte addresses exactly representable even
+            // when guest RDRAM addresses exceed the float integer precision.
+            glUniform1f(aliasOffset,float(int64_t(destination.address)-source.address));
+            glUniform2f(aliasBounds,float(begin-destination.address),float(end-destination.address));
+            std::vector<FastVertex> quad(6);
+            const float xy[6][2]={{-1,-1},{1,-1},{1,1},{-1,-1},{1,1},{-1,1}};
+            for(unsigned i=0;i<6;++i) {
+                quad[i].position[0]=xy[i][0]; quad[i].position[1]=xy[i][1];
+                quad[i].uv[0]=(xy[i][0]+1)/2; quad[i].uv[1]=(xy[i][1]+1)/2;
+            }
+            vertices(quad);
+            std::swap(destination.texture,destination.memoryScratch); destination.snapshot.reset();
+            if(glGetError()!=GL_NO_ERROR) throw std::runtime_error("RT64 Fast framebuffer alias copy failed");
+        }
+        void synchronizeAliases(Target &destination,bool checkMemory=true) {
+            if(checkMemory) synchronizeMemory(destination,destination.address);
+            if(destination.syncVersion==contentVersion) return;
+            std::vector<Target *> sources;
+            for(auto &entry:targets) {
+                auto &source=entry.second;
+                if(&source!=&destination && source.writeVersion>destination.syncVersion
+                    && source.address<endAddress(destination) && destination.address<endAddress(source)) sources.push_back(&source);
+            }
+            std::sort(sources.begin(),sources.end(),[](const auto *a,const auto *b){return a->writeVersion<b->writeVersion;});
+            for(auto *source:sources) {
+                synchronizeMemory(*source,source->address);
+                copyAlias(destination,*source);
+            }
+            destination.syncVersion=contentVersion;
+        }
+        bool redundant(const Target &candidate) const {
+            if(!candidate.writeVersion) return true;
+            // Reads and snapshots need one view containing their whole range.
+            // Coverage by several smaller views cannot replace that view.
+            for(const auto &entry:targets) {
+                const auto &other=entry.second;
+                if(&other!=&candidate && other.writeVersion>candidate.writeVersion
+                    && other.address<=candidate.address && endAddress(other)>=endAddress(candidate)) return true;
+            }
+            return false;
+        }
+        void trimTargets(Target &current) {
+            while(targets.size()>16) {
+                auto old=std::find_if(targets.begin(),targets.end(),[&](const auto &entry) {
+                    return &entry.second!=&current && redundant(entry.second);
+                });
+                if(old==targets.end()) {
+                    // Refresh a containing view before retiring its smaller
+                    // representations. Never drop the sole copy of GPU bytes.
+                    Target *container=nullptr;
+                    for(auto &entry:targets) {
+                        auto &t=entry.second;
+                        for(const auto &other:targets) if(&t!=&other.second && &other.second!=&current
+                            && t.address<=other.second.address && endAddress(t)>=endAddress(other.second)) {
+                            if(!container || endAddress(t)-t.address>endAddress(*container)-container->address) container=&t;
+                        }
+                    }
+                    if(!container) throw std::runtime_error("RT64 Fast framebuffer limit exceeded");
+                    synchronizeAliases(*container);
+                    container->writeVersion=container->syncVersion=++contentVersion;
+                    continue;
+                }
+                destroyTarget(old->second,old->second.address); targets.erase(old);
+            }
+        }
 
         void captureMemory(Target &t,uint32_t address) {
             if(!rdram) return;
@@ -163,21 +365,26 @@ namespace {
         void synchronizeMemory(Target &t,uint32_t address,const std::vector<FastMemoryWrite> *writes=nullptr) {
             if(!rdram || t.memoryShadow.empty()
                 || (!writes && !std::memcmp(rdram+t.shadowAddress,t.memoryShadow.data(),t.memoryShadow.size()))) return;
-            std::vector<uint8_t> memory(rdram+t.shadowAddress,rdram+t.shadowAddress+t.memoryShadow.size());
+            std::vector<uint8_t> memory= writes ? t.memoryShadow : std::vector<uint8_t>(rdram+t.shadowAddress,rdram+t.shadowAddress+t.memoryShadow.size());
+            if(!writes) {
+                std::vector<FastMemoryWrite> observed;
+                for(uint32_t at=address;uint64_t(at)<endAddress(t);++at) {
+                    const uint32_t offset=(at^3)-t.shadowAddress;
+                    if(memory[offset]==t.memoryShadow[offset]) continue;
+                    const uint32_t word=at&~31U;
+                    if(observed.empty() || observed.back().address!=word) observed.push_back({word,0});
+                    observed.back().mask|=1U<<(at&31); observed.back().bytes[at&31]=memory[offset];
+                }
+                if(observed.empty()) t.memoryShadow=std::move(memory);
+                else notifyMemoryWrites(observed);
+                return;
+            }
             // RAM is a shadow of CPU writes, not a copy of the GPU image. Only
             // changed bytes are authoritative here. Merge in a shader so that
             // partial RGBA16 pixels do not require a CPU GPU-readback round trip.
             std::vector<uint8_t> pixels(size_t(t.width)*t.height*4),mask(pixels.size());
             bool changed=false;
-            for(unsigned y=0;y<t.height;++y) for(unsigned x=0;x<t.width;++x) {
-                const size_t pixel=((t.height-1-y)*t.width+x)*4;
-                for(unsigned c=0;c<t.colorBytes;++c) {
-                    const uint32_t at=(address+(y*t.width+x)*t.colorBytes+c)^3;
-                    pixels[pixel+c]=memory[at-t.shadowAddress];
-                    if(memory[at-t.shadowAddress]!=t.memoryShadow[at-t.shadowAddress]) { mask[pixel+c]=255; changed=true; }
-                }
-            }
-            if(writes) for(const auto &write:*writes) for(unsigned i=0;i<32;++i) if(write.mask&(1U<<i)) {
+            for(const auto &write:*writes) for(unsigned i=0;i<32;++i) if(write.mask&(1U<<i)) {
                 const uint64_t at=uint64_t(write.address)+i;
                 if(at<address || at>=uint64_t(address)+uint64_t(t.width)*t.height*t.colorBytes) continue;
                 const uint32_t offset=at-address,pixel=offset/t.colorBytes;
@@ -313,15 +520,13 @@ void main() { gl_FragColor = vec4(0.0); }
             }
             depthTargets.clear();
         }
-        Target &target(const FastDraw &draw) {
+        Target &target(const FastDraw &draw,bool rasterizes=true) {
             if(draw.colorBytes!=2 && draw.colorBytes!=4) throw std::runtime_error("RT64 Fast invalid framebuffer pixel size");
-            auto &t=targets[draw.colorAddress];
-            if (t.fbo && (t.width != draw.width || t.height != draw.height || t.colorBytes != draw.colorBytes)) {
-                destroyTarget(t,draw.colorAddress); t={};
-            }
+            if(!draw.width || !draw.height || draw.width>1024 || draw.height>1024)
+                throw std::runtime_error("RT64 Fast invalid framebuffer dimensions");
+            auto &t=targets[{draw.colorAddress,draw.width,draw.height,draw.colorBytes}];
             if (!t.fbo) {
-                if (targets.size() > 16) throw std::runtime_error("RT64 Fast framebuffer limit exceeded");
-                t.width=draw.width; t.height=draw.height;
+                t.address=draw.colorAddress; t.width=draw.width; t.height=draw.height;
                 t.colorBytes=draw.colorBytes;
                 captureMemory(t,draw.colorAddress);
                 const auto pixels=initialPixels(t,draw.colorAddress);
@@ -344,7 +549,8 @@ void main() { gl_FragColor = vec4(0.0); }
             if(!draw.memoryEpoch || t.memoryEpoch!=draw.memoryEpoch) {
                 synchronizeMemory(t,draw.colorAddress); t.memoryEpoch=draw.memoryEpoch;
             }
-            if(draw.depthTest || draw.depthWrite) {
+            synchronizeAliases(t,false);
+            if(rasterizes && (draw.depthTest || draw.depthWrite)) {
                 auto &depth=depthTarget(draw.depthAddress,draw.width,draw.height);
                 bindDepthTarget(depth,t.texture);
             } else glBindFramebuffer(GL_FRAMEBUFFER,t.fbo);
@@ -476,7 +682,7 @@ void main() {
         ~FastGLSink() override {
             glFinish();
             imagePool->clear(); imagePool.reset();
-            for(auto &pair:targets) destroyTarget(pair.second,pair.first);
+            for(auto &pair:targets) destroyTarget(pair.second,pair.second.address);
             destroyDepthTargets();
             for(auto &pair:programs) glDeleteProgram(pair.second.id);
             glDeleteShader(vertexShader);
@@ -486,6 +692,7 @@ void main() {
             if(memoryPixels) glDeleteTextures(1,&memoryPixels);
             if(memoryMask) glDeleteTextures(1,&memoryMask);
             if(depthClearProgram) glDeleteProgram(depthClearProgram);
+            if(aliasProgram) glDeleteProgram(aliasProgram);
         }
         void draw(const FastDraw &d) override {
             if(d.clearDepth) {
@@ -493,7 +700,16 @@ void main() {
                 clearDepthTarget(depth,d.width,d.height,scissorBounds(d,true));
                 return;
             }
-            target(d); scissor(d);
+            const auto bounds=scissorBounds(d);
+            const bool rasterizes=!d.vertices.empty() && std::min(bounds[2],int(d.width))>std::max(bounds[0],0)
+                && std::min(bounds[3],int(d.height))>std::max(bounds[1],0);
+            auto &destination=target(d,rasterizes);
+            if(!rasterizes) {
+                destination.writeVersion=destination.syncVersion=destination.lastDraw=++contentVersion;
+                trimTargets(destination);
+                return;
+            }
+            scissor(d);
             const auto key=fastShaderKey(d);
             auto found=programs.find(key);
             if(found==programs.end()) {
@@ -540,44 +756,53 @@ void main() {
             vertices(d.vertices);
             GLenum error=glGetError();
             if(error!=GL_NO_ERROR) throw std::runtime_error("RT64 Fast GL draw error "+std::to_string(error));
+            destination.writeVersion=destination.syncVersion=destination.lastDraw=++contentVersion;
+            markDrawnBytes(d); trimTargets(destination);
         }
         void fullSync() override { glFlush(); }
         void setRDRAM(const uint8_t *memory,size_t size) override {
             if(memory==rdram && size==rdramSize) return;
             if(!targets.empty() || !depthTargets.empty()) {
                 glFinish();
-                for(auto &entry:targets) destroyTarget(entry.second,entry.first);
+                for(auto &entry:targets) destroyTarget(entry.second,entry.second.address);
                 targets.clear(); destroyDepthTargets();
             }
+            contentVersion=0; gpuRanges.clear();
             rdram=memory; rdramSize=size;
         }
         void setMemoryWriteTracking(std::function<void(uint32_t,uint32_t,bool)> watch) override {
             for(auto &entry:targets) if(entry.second.memoryWatched) {
-                watchMemory(entry.first,entry.second.width*entry.second.height*entry.second.colorBytes,false);
+                watchMemory(entry.second.address,entry.second.width*entry.second.height*entry.second.colorBytes,false);
                 entry.second.memoryWatched=false;
             }
             watchMemory=std::move(watch);
             if(watchMemory) for(auto &entry:targets) {
                 auto &t=entry.second;
-                watchMemory(entry.first,t.width*t.height*t.colorBytes,true); t.memoryWatched=true;
+                watchMemory(t.address,t.width*t.height*t.colorBytes,true); t.memoryWatched=true;
             }
         }
         void notifyMemoryWrites(const std::vector<FastMemoryWrite> &writes) override {
             for(auto &entry:targets) {
-                const uint64_t end=uint64_t(entry.first)+uint64_t(entry.second.width)*entry.second.height*entry.second.colorBytes;
+                const uint64_t end=endAddress(entry.second);
                 const bool overlaps=std::any_of(writes.begin(),writes.end(),[&](const auto &write) {
-                    return write.mask && write.address<end && uint64_t(write.address)+32>entry.first;
+                    return write.mask && write.address<end && uint64_t(write.address)+32>entry.second.address;
                 });
-                if(overlaps) synchronizeMemory(entry.second,entry.first,&writes);
+                if(overlaps) synchronizeMemory(entry.second,entry.second.address,&writes);
             }
+            uint64_t begin=0,end=0;
+            for(const auto &write:writes) for(unsigned i=0;i<32;++i) if(write.mask&(1U<<i)) {
+                const uint64_t at=uint64_t(write.address)+i;
+                if(begin!=end && at==end) ++end;
+                else { if(begin!=end) clearGpuBytes(begin,end); begin=at; end=at+1; }
+            }
+            if(begin!=end) clearGpuBytes(begin,end);
         }
         std::shared_ptr<const FastFramebuffer> snapshotFramebuffer(uint32_t address,uint32_t size) override {
-            auto found=targets.upper_bound(address);
-            if(!size || found==targets.begin()) return {};
-            --found;
-            auto &t=found->second;
-            if(uint64_t(address-found->first)+size>uint64_t(t.width)*t.height*t.colorBytes) return {};
-            synchronizeMemory(t,found->first);
+            auto *found=findTarget(address,size);
+            if(!size || !found) return {};
+            auto &t=*found;
+            synchronizeAliases(t);
+            if(!hasGpuBytes(address,uint64_t(address)+size)) return {};
             if(auto cached=t.snapshot.lock()) return cached;
             auto image=std::make_shared<ImageStorage>();
             image->width=t.width; image->height=t.height; image->invertedY=true; image->pool=imagePool;
@@ -610,7 +835,7 @@ void main() {
             auto texture=std::make_shared<FastTexture>();
             texture->width=t.width; texture->height=t.height; texture->storage=image; texture->hash=++snapshotSerial;
             auto snapshot=std::make_shared<FastFramebuffer>();
-            snapshot->address=found->first; snapshot->width=t.width; snapshot->height=t.height;
+            snapshot->address=t.address; snapshot->width=t.width; snapshot->height=t.height;
             snapshot->colorBytes=t.colorBytes; snapshot->texture=texture;
             t.snapshot=snapshot;
             return snapshot;
@@ -624,14 +849,11 @@ void main() {
         }
         bool readFramebuffer(uint32_t address,uint32_t size,std::vector<uint8_t> &bytes) override {
             if(!size) { bytes.clear(); return true; }
-            auto found=targets.upper_bound(address);
-            if(found==targets.begin()) return false;
-            --found;
-            auto &t=found->second;
-            const uint32_t offset=address-found->first;
-            const uint64_t end=uint64_t(offset)+size;
-            if(end>uint64_t(t.width)*t.height*t.colorBytes) return false;
-            synchronizeMemory(t,found->first);
+            auto *found=findTarget(address,size);
+            if(!found) return false;
+            auto &t=*found;
+            const uint32_t offset=address-t.address;
+            synchronizeAliases(t);
             return readPixels(t.fbo,t.width,t.height,t.colorBytes,offset,size,bytes);
         }
         bool readPixels(GLuint fbo,uint32_t width,uint32_t height,uint32_t colorBytes,uint32_t offset,uint32_t size,std::vector<uint8_t> &bytes) {
@@ -675,26 +897,22 @@ void main() {
             presentTarget(address,true,1.0f);
         }
         void present(const VI &vi) override {
-            presentTarget(vi.fbAddress(),vi.visible(),vi.gamma());
+            presentTarget(vi.fbAddress(),vi.visible(),vi.gamma(),vi.width);
         }
-        void presentTarget(uint32_t address,bool visible,float gamma) {
+        void presentTarget(uint32_t address,bool visible,float gamma,uint32_t width=0) {
             // The VI origin includes the field's scanline offset (0x280 bytes
             // for a standard 320-wide RGBA16 image). Find the containing color
             // image rather than requiring its base address to equal the origin.
             glBindFramebuffer(GL_FRAMEBUFFER,0); glViewport(0,0,960,544);
             glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_BLEND); glDisable(GL_POLYGON_OFFSET_FILL);
             glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT);
-            auto found=targets.upper_bound(address);
-            if(found==targets.begin()) visible=false;
-            else {
-                --found;
-                if(address-found->first >= found->second.width*found->second.height*found->second.colorBytes) visible=false;
-            }
+            auto *found=findTarget(address,1,width);
+            if(!found) visible=false;
             if(visible) {
-            synchronizeMemory(found->second,found->first);
+            synchronizeAliases(*found);
             // Memory merging renders offscreen; restore the scanout target.
             glBindFramebuffer(GL_FRAMEBUFFER,0); glViewport(0,0,960,544);
-            glUseProgram(blit); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,found->second.texture);
+            glUseProgram(blit); glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,found->texture);
             glUniform1f(blitGamma,gamma);
             glUniform1f(blitQuantize,0);
             const float halfWidth=(4.0f/3.0f)/(960.0f/544.0f);
