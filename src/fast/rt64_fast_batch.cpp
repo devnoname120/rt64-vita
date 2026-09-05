@@ -53,6 +53,12 @@ namespace {
             flush(); return backend->readFramebuffer(address,size,bytes);
         }
         void setRDRAM(const uint8_t *rdram,size_t size) override { flush(); backend->setRDRAM(rdram,size); }
+        void setMemoryWriteTracking(std::function<void(uint32_t,uint32_t,bool)> watch) override {
+            flush(); backend->setMemoryWriteTracking(std::move(watch));
+        }
+        void notifyMemoryWrites(const std::vector<FastMemoryWrite> &writes) override {
+            flush(); backend->notifyMemoryWrites(writes);
+        }
         std::shared_ptr<const FastFramebuffer> snapshotFramebuffer(uint32_t address,uint32_t size) override {
             flush(); return backend->snapshotFramebuffer(address,size);
         }

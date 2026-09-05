@@ -72,6 +72,7 @@ namespace {
         uint32_t shadowAddress=0;
         std::vector<uint8_t> memoryShadow;
         GLuint memoryScratch=0;
+        bool memoryWatched=false;
     };
     struct ImagePool {
         std::map<GLuint,GLuint> images;
@@ -134,6 +135,7 @@ namespace {
         GLuint memoryMerge=0,memoryPixels=0,memoryMask=0;
         GLint memoryColorBytes=-1;
         std::function<void()> swapBuffers;
+        std::function<void(uint32_t,uint32_t,bool)> watchMemory;
 
         void captureMemory(Target &t,uint32_t address) {
             if(!rdram) return;
@@ -159,9 +161,9 @@ namespace {
             }
             return pixels;
         }
-        void synchronizeMemory(Target &t,uint32_t address) {
+        void synchronizeMemory(Target &t,uint32_t address,const std::vector<FastMemoryWrite> *writes=nullptr) {
             if(!rdram || t.memoryShadow.empty()
-                || !std::memcmp(rdram+t.shadowAddress,t.memoryShadow.data(),t.memoryShadow.size())) return;
+                || (!writes && !std::memcmp(rdram+t.shadowAddress,t.memoryShadow.data(),t.memoryShadow.size()))) return;
             std::vector<uint8_t> memory(rdram+t.shadowAddress,rdram+t.shadowAddress+t.memoryShadow.size());
             // RAM is a shadow of CPU writes, not a copy of the GPU image. Only
             // changed bytes are authoritative here. Merge in a shader so that
@@ -175,6 +177,14 @@ namespace {
                     pixels[pixel+c]=memory[at-t.shadowAddress];
                     if(memory[at-t.shadowAddress]!=t.memoryShadow[at-t.shadowAddress]) { mask[pixel+c]=255; changed=true; }
                 }
+            }
+            if(writes) for(const auto &write:*writes) for(unsigned i=0;i<32;++i) if(write.mask&(1U<<i)) {
+                const uint64_t at=uint64_t(write.address)+i;
+                if(at<address || at>=uint64_t(address)+uint64_t(t.width)*t.height*t.colorBytes) continue;
+                const uint32_t offset=at-address,pixel=offset/t.colorBytes;
+                const size_t index=((t.height-1-pixel/t.width)*t.width+pixel%t.width)*4+offset%t.colorBytes;
+                pixels[index]=write.bytes[i]; mask[index]=255; changed=true;
+                memory[(uint32_t(at)^3)-t.shadowAddress]=write.bytes[i];
             }
             if(changed) {
                 if(!memoryMerge) {
@@ -243,7 +253,7 @@ void main() {
             if(draw.colorBytes!=2 && draw.colorBytes!=4) throw std::runtime_error("RT64 Fast invalid framebuffer pixel size");
             auto &t=targets[draw.colorAddress];
             if (t.fbo && (t.width != draw.width || t.height != draw.height || t.depthAddress != draw.depthAddress || t.colorBytes != draw.colorBytes)) {
-                destroyTarget(t); t={};
+                destroyTarget(t,draw.colorAddress); t={};
             }
             if (!t.fbo) {
                 if (targets.size() > 16) throw std::runtime_error("RT64 Fast framebuffer limit exceeded");
@@ -266,6 +276,9 @@ void main() {
                     throw std::runtime_error("RT64 Fast framebuffer is incomplete");
                 glDisable(GL_SCISSOR_TEST); glDepthMask(GL_TRUE);
                 glClearColor(0,0,0,1); clearDepth(1); glClear(GL_DEPTH_BUFFER_BIT|(pixels.empty()?GL_COLOR_BUFFER_BIT:0));
+                if(watchMemory) {
+                    watchMemory(draw.colorAddress,t.width*t.height*t.colorBytes,true); t.memoryWatched=true;
+                }
             }
             if(!draw.memoryEpoch || t.memoryEpoch!=draw.memoryEpoch) {
                 synchronizeMemory(t,draw.colorAddress); t.memoryEpoch=draw.memoryEpoch;
@@ -275,7 +288,8 @@ void main() {
             t.snapshot.reset();
             return t;
         }
-        static void destroyTarget(Target &t) {
+        void destroyTarget(Target &t,uint32_t address) {
+            if(t.memoryWatched) { watchMemory(address,t.width*t.height*t.colorBytes,false); t.memoryWatched=false; }
             if(t.fbo) glDeleteFramebuffers(1,&t.fbo);
             if(t.texture) glDeleteTextures(1,&t.texture);
             if(t.depth) glDeleteRenderbuffers(1,&t.depth);
@@ -390,7 +404,7 @@ void main() {
         ~FastGLSink() override {
             glFinish();
             imagePool->clear(); imagePool.reset();
-            for(auto &pair:targets) destroyTarget(pair.second);
+            for(auto &pair:targets) destroyTarget(pair.second,pair.first);
             for(auto &pair:programs) glDeleteProgram(pair.second.id);
             glDeleteShader(vertexShader);
             for(auto &pair:textures) glDeleteTextures(1,&pair.second.id);
@@ -460,8 +474,28 @@ void main() {
         void fullSync() override { glFlush(); }
         void setRDRAM(const uint8_t *memory,size_t size) override {
             if(memory==rdram && size==rdramSize) return;
-            if(!targets.empty()) { glFinish(); for(auto &entry:targets) destroyTarget(entry.second); targets.clear(); }
+            if(!targets.empty()) { glFinish(); for(auto &entry:targets) destroyTarget(entry.second,entry.first); targets.clear(); }
             rdram=memory; rdramSize=size;
+        }
+        void setMemoryWriteTracking(std::function<void(uint32_t,uint32_t,bool)> watch) override {
+            for(auto &entry:targets) if(entry.second.memoryWatched) {
+                watchMemory(entry.first,entry.second.width*entry.second.height*entry.second.colorBytes,false);
+                entry.second.memoryWatched=false;
+            }
+            watchMemory=std::move(watch);
+            if(watchMemory) for(auto &entry:targets) {
+                auto &t=entry.second;
+                watchMemory(entry.first,t.width*t.height*t.colorBytes,true); t.memoryWatched=true;
+            }
+        }
+        void notifyMemoryWrites(const std::vector<FastMemoryWrite> &writes) override {
+            for(auto &entry:targets) {
+                const uint64_t end=uint64_t(entry.first)+uint64_t(entry.second.width)*entry.second.height*entry.second.colorBytes;
+                const bool overlaps=std::any_of(writes.begin(),writes.end(),[&](const auto &write) {
+                    return write.mask && write.address<end && uint64_t(write.address)+32>entry.first;
+                });
+                if(overlaps) synchronizeMemory(entry.second,entry.first,&writes);
+            }
         }
         std::shared_ptr<const FastFramebuffer> snapshotFramebuffer(uint32_t address,uint32_t size) override {
             auto found=targets.upper_bound(address);

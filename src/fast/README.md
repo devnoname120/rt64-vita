@@ -31,9 +31,13 @@ back to materializing the snapshot through CPU readback.
 The GL sink observes changes against a shadow of word-swapped RDRAM. A GPU merge
 preserves untouched framebuffer bytes while replacing changed bytes, including
 partial RGBA16 pixels and RGBA32 alpha. This avoids CPU readback for that merge.
-Byte comparison cannot detect CPU stores that leave the RAM byte unchanged;
-exact write notifications and overlapping GPU framebuffer aliases remain open.
-These limitations also apply when old framebuffer memory is reused for textures.
+For stores that leave RAM unchanged, integrations can install a watched-range
+callback with `setMemoryWriteTracking` and deliver `FastMemoryWrite` byte masks
+through `notifyMemoryWrites`. The sink updates every resident target intersecting
+those records, including same-value stores, without modifying earlier snapshots.
+Flush earlier work before delivering writes at graphics task/readback/presentation
+boundaries. RAM comparison remains a fallback for writes that were not reported.
+Overlapping GPU framebuffer aliases still require further work.
 
 This is a reduced renderer under development, not full RT64 compatibility.
 General framebuffer coherence, remaining VI stride/scaling, extended GBI and unsupported

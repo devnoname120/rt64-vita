@@ -45,6 +45,10 @@ namespace RT64 {
         uint32_t address=0,width=0,height=0,colorBytes=0;
         std::shared_ptr<const FastTexture> texture;
     };
+    struct FastMemoryWrite {
+        uint32_t address=0,mask=0;
+        std::array<uint8_t,32> bytes{}; // N64 byte order; one mask bit per byte.
+    };
 
     struct FastDraw {
         interop::OtherMode otherMode{};
@@ -85,6 +89,11 @@ namespace RT64 {
         virtual bool readFramebuffer(uint32_t address,uint32_t size,std::vector<uint8_t> &bytes);
         // Memory belongs to the state/runtime and must outlive renderer use.
         virtual void setRDRAM(const uint8_t *rdram,size_t size);
+        // The callback registers/releases resident color-image ranges with the
+        // runtime. Deliver recorded writes on the graphics thread before its
+        // next task/readback/presentation, after earlier work has been flushed.
+        virtual void setMemoryWriteTracking(std::function<void(uint32_t,uint32_t,bool)> watch);
+        virtual void notifyMemoryWrites(const std::vector<FastMemoryWrite> &writes);
         // Capture the containing color image before later draws modify it.
         // Compatible TMEM rectangles sample views directly; other layouts can
         // materialize the same captured image through readFramebufferSnapshot.
