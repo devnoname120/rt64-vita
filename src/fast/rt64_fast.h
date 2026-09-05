@@ -26,10 +26,24 @@ namespace RT64 {
         uint16_t line = 0, tmem = 0, uls = 0, ult = 0, lrs = 0, lrt = 0;
     };
 
+    struct FastTextureStorage {
+        uint32_t width=0,height=0;
+        bool invertedY=false;
+        virtual ~FastTextureStorage() = default;
+    };
     struct FastTexture {
         uint32_t width = 0, height = 0;
         uint64_t hash = 0;
         std::vector<uint8_t> rgba;
+        // A GPU snapshot view has storage instead of CPU pixels. The sink owns
+        // its graphics resources; retained views keep the loaded image immutable.
+        std::shared_ptr<const FastTextureStorage> storage;
+        uint32_t storageX=0,storageY=0;
+    };
+
+    struct FastFramebuffer {
+        uint32_t address=0,width=0,height=0,colorBytes=0;
+        std::shared_ptr<const FastTexture> texture;
     };
 
     struct FastDraw {
@@ -39,6 +53,9 @@ namespace RT64 {
         std::array<float, 3> keyCenter{}, keyScale{};
         float lodFraction = 0, k4 = 0, k5 = 0;
         uint32_t colorAddress = 0, depthAddress = 0;
+        // Nonzero epochs group one task's draws for CPU-memory observation.
+        // Direct callers can leave zero to check at every draw.
+        uint64_t memoryEpoch=0;
         uint32_t width = 320, height = 240;
         uint32_t colorBytes = 2;
         std::array<int32_t, 4> scissor{0, 0, 1280, 960}; // 10.2 screen coordinates.
@@ -57,6 +74,7 @@ namespace RT64 {
         virtual ~FastDrawSink() = default;
         virtual void draw(const FastDraw &draw) = 0;
         virtual void fullSync() = 0;
+        virtual void flushDraws() {}
         virtual void present(uint32_t colorAddress) = 0;
         // Real scanout carries visibility and gamma as well as an address. The
         // address-only form remains useful for isolated draw diagnostics.
@@ -65,6 +83,13 @@ namespace RT64 {
         // or RGBA32), top scanline first. False means the range is not resident;
         // callers should retain the existing RDRAM contents in that case.
         virtual bool readFramebuffer(uint32_t address,uint32_t size,std::vector<uint8_t> &bytes);
+        // Memory belongs to the state/runtime and must outlive renderer use.
+        virtual void setRDRAM(const uint8_t *rdram,size_t size);
+        // Capture the containing color image before later draws modify it.
+        // Compatible TMEM rectangles sample views directly; other layouts can
+        // materialize the same captured image through readFramebufferSnapshot.
+        virtual std::shared_ptr<const FastFramebuffer> snapshotFramebuffer(uint32_t address,uint32_t size);
+        virtual bool readFramebufferSnapshot(const FastFramebuffer &snapshot,std::vector<uint8_t> &bytes);
     };
 
     // GLSL ES 1.00; combiner operands are decoded by RT64's shared ColorCombiner.

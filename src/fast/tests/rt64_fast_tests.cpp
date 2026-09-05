@@ -22,6 +22,67 @@ namespace {
         void fullSync() override { ++syncs; }
         void present(uint32_t address) override { presents.push_back(address); }
     };
+    void framebufferTMEM() {
+        struct FeedbackCapture : Capture {
+            std::shared_ptr<FastFramebuffer> image;
+            std::vector<uint8_t> bytes;
+            unsigned reads=0;
+            std::shared_ptr<const FastFramebuffer> snapshotFramebuffer(uint32_t address,uint32_t size) override {
+                return image && address>=image->address && uint64_t(address-image->address)+size<=bytes.size()?image:nullptr;
+            }
+            bool readFramebufferSnapshot(const FastFramebuffer &source,std::vector<uint8_t> &out) override {
+                check(&source==image.get(),"wrong framebuffer snapshot materialized"); ++reads; out=bytes; return true;
+            }
+            void configure(unsigned bpp,unsigned height) {
+                image=std::make_shared<FastFramebuffer>();
+                image->address=0x1000; image->width=8; image->height=height; image->colorBytes=bpp;
+                auto texture=std::make_shared<FastTexture>(); auto storage=std::make_shared<FastTextureStorage>();
+                storage->width=8; storage->height=height; storage->invertedY=true;
+                texture->width=8; texture->height=height; texture->hash=bpp; texture->storage=storage; image->texture=texture;
+                bytes.resize(8*height*bpp);
+                for(unsigned i=0;i<8*height;++i) {
+                    if(bpp==2) { bytes[2*i]=i<32?0xf8:0; bytes[2*i+1]=i<32?1:0x3f; }
+                    else { bytes[4*i]=i; bytes[4*i+1]=2*i; bytes[4*i+2]=3*i; bytes[4*i+3]=255; }
+                }
+            }
+        } sink;
+        std::vector<uint32_t> memory(8192);
+        State state(reinterpret_cast<uint8_t *>(memory.data()),memory.size()*4,sink);
+        auto &rdp=*state.rdp;
+        sink.configure(2,8);
+        rdp.setTextureImage(G_IM_FMT_RGBA,G_IM_SIZ_16b,8,0x1000);
+        rdp.setTile(7,G_IM_FMT_RGBA,G_IM_SIZ_16b,1,0,0,G_TX_CLAMP,G_TX_CLAMP,0,0,0,0);
+        rdp.loadTile(7,8,4,20,24);
+        rdp.setTile(0,G_IM_FMT_RGBA,G_IM_SIZ_16b,1,0,0,G_TX_CLAMP,G_TX_CLAMP,0,0,0,0);
+        rdp.setTileSize(0,0,0,12,20);
+        auto view=rdp.decodeTexture(0);
+        check(view->storage==sink.image->texture->storage && view->storageX==2 && view->storageY==1 && sink.reads==0,
+            "GPU framebuffer view lost tile provenance");
+        for(unsigned i=0;i<8;++i) state.RDRAM[(0x3000+i)^3]=(i&1)?0xc1:7;
+        rdp.setTextureImage(G_IM_FMT_RGBA,G_IM_SIZ_16b,4,0x3000);
+        rdp.loadTile(7,0,0,12,0);
+        auto mixed=rdp.decodeTexture(0);
+        check(!mixed->storage && sink.reads==1,"mixed framebuffer/RAM tile did not materialize its snapshot");
+        check(mixed->rgba[0]==0 && mixed->rgba[1]==255 && mixed->rgba[2]==0,"RAM overwrite was lost");
+        check(mixed->rgba[16]==255 && mixed->rgba[17]==0,"untouched framebuffer TMEM was lost");
+        rdp.setTile(1,G_IM_FMT_RGBA,G_IM_SIZ_16b,1,2,0,G_TX_CLAMP,G_TX_CLAMP,0,0,0,0);
+        rdp.setTileSize(1,0,0,12,0);
+        check(rdp.decodeTexture(1)->storage==view->storage,"materialization destroyed another GPU view");
+
+        // A complete ordinary load releases the previous framebuffer records.
+        rdp.setTile(7,G_IM_FMT_RGBA,G_IM_SIZ_16b,0,0,0,0,0,0,0,0,0);
+        rdp.loadBlock(7,0,0,2047,0);
+        check(rdp.framebufferLoads.empty(),"overwritten framebuffer loads remained live");
+        sink.configure(4,4); sink.reads=0;
+        rdp.setTextureImage(G_IM_FMT_RGBA,G_IM_SIZ_32b,8,0x1000);
+        rdp.setTile(7,G_IM_FMT_RGBA,G_IM_SIZ_32b,0,8,0,0,0,0,0,0,0);
+        rdp.loadBlock(7,0,0,31,512);
+        rdp.setTile(0,G_IM_FMT_RGBA,G_IM_SIZ_32b,2,8,0,G_TX_CLAMP,G_TX_CLAMP,0,0,0,0);
+        rdp.setTileSize(0,0,0,28,12);
+        auto rgba32=rdp.decodeTexture(0);
+        check(rgba32->storage==sink.image->texture->storage && rgba32->width==8 && rgba32->height==4 && sink.reads==0,
+            "RGBA32 framebuffer bank split or load-block row swap is incorrect");
+    }
     void shaderProgramKeys() {
         // Compare source as the oracle: a shared cache key must never alias
         // different programs, including changes in each individual mode bit.
@@ -270,7 +331,7 @@ namespace {
 }
 int main(int argc, char **argv) {
     try {
-        memoryAndControlFlow(); matrixStackBounds(); triangleAndFill(); vertexProcessing(); tmemLoads(); paletteAndIntensity(); drawBatching(); shaderProgramKeys();
+        memoryAndControlFlow(); matrixStackBounds(); triangleAndFill(); vertexProcessing(); tmemLoads(); paletteAndIntensity(); drawBatching(); shaderProgramKeys(); framebufferTMEM();
         std::cout << "RT64 Fast: RDRAM, GBI execution, vertices, fill, TMEM tile/block, RGBA32, CI4, cache, batching and rejection tests passed\n";
         if (argc == 2) {
             // Optional real-game microcode check. The ROM is never a test

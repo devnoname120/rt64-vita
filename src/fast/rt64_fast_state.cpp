@@ -7,6 +7,7 @@ namespace RT64 {
         if (!rdram || size < 4096 || (size & 3) || (reinterpret_cast<uintptr_t>(rdram) & 3)) {
             throw std::invalid_argument("RT64 Fast requires aligned, word-swapped RDRAM");
         }
+        sink.setRDRAM(rdram,size);
     }
     State::~State() = default;
     uint8_t *State::fromRDRAM(uint32_t address, size_t bytes) const {

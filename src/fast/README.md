@@ -22,8 +22,21 @@ synchronize CPU framebuffer consumers and convert the guest's memory byte order.
 Host tests cover readback packing and ranges, but Vita3K's macOS Vulkan surface
 readback is a known validation limitation.
 
+Framebuffer texture loads retain TMEM byte provenance and immutable GPU snapshots.
+Compatible RGBA16/32 rectangles sample the captured image directly, including
+subregions, split load/render tiles and RGBA32 TMEM banks. Later draws cannot
+change an already loaded image. Mixed layouts and format reinterpretations fall
+back to materializing the snapshot through CPU readback.
+
+The GL sink observes changes against a shadow of word-swapped RDRAM. A GPU merge
+preserves untouched framebuffer bytes while replacing changed bytes, including
+partial RGBA16 pixels and RGBA32 alpha. This avoids CPU readback for that merge.
+Byte comparison cannot detect CPU stores that leave the RAM byte unchanged;
+exact write notifications and overlapping GPU framebuffer aliases remain open.
+These limitations also apply when old framebuffer memory is reused for textures.
+
 This is a reduced renderer under development, not full RT64 compatibility.
-Framebuffer feedback, remaining VI stride/scaling, extended GBI and unsupported
+General framebuffer coherence, remaining VI stride/scaling, extended GBI and unsupported
 microcodes need further work. Existing DK64 boot/gameplay evidence does not prove
 support for other games or performance on physical Vita hardware.
 

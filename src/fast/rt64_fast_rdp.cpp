@@ -59,6 +59,18 @@ namespace {
         const bool rgba32 = t.fmt == G_IM_FMT_RGBA && t.siz == G_IM_SIZ_32b;
         const uint32_t mask = rgba32 ? 2047 : 4095, advance = rgba32 ? 4 : 8;
         const uint32_t tmemStride = uint32_t(t.line) << (palette ? 5 : 3);
+        const uint64_t span=uint64_t(rows-1)*stride+uint64_t(words)*(palette?2:8);
+        state->fromRDRAM(start,span);
+        auto framebuffer=state->sink.snapshotFramebuffer(start,uint32_t(span));
+        uint32_t load=0;
+        std::shared_ptr<const std::vector<uint8_t>> loadedBytes;
+        if(framebuffer) {
+            do { ++nextFramebufferLoad; } while(!nextFramebufferLoad || framebufferLoads.count(nextFramebufferLoad));
+            load=nextFramebufferLoad;
+            for(const auto &entry:framebufferLoads)
+                if(entry.second.image==framebuffer && entry.second.bytes) { loadedBytes=entry.second.bytes; break; }
+            framebufferLoads.emplace(load,FramebufferLoad{framebuffer,loadedBytes,0});
+        }
         uint32_t dxtCounter = 0, swap = 0;
         for (uint32_t row = 0; row < rows; ++row) {
             uint32_t dst = ((uint32_t(t.tmem) << 3) + row * tmemStride) & mask;
@@ -66,12 +78,16 @@ namespace {
             for (uint32_t word = 0; word < words; ++word) {
                 state->fromRDRAM(src, palette ? 2 : 8);
                 for (unsigned byte = 0; byte < 8; ++byte) {
-                    const uint8_t v = state->readU8(src + (palette ? (byte & 1) : byte));
+                    const uint32_t source=src+(palette?(byte&1):byte);
+                    const uint8_t v=loadedBytes?loadedBytes->at(source-framebuffer->address):state->readU8(source);
+                    uint32_t destination;
                     if (rgba32) {
                         const uint32_t bank = (byte & 2) ? 2048 : 0;
                         const uint32_t offset = (byte / 4) * 2 + (byte & 1);
-                        tmem[(((dst + offset) & mask) ^ swap) | bank] = v;
-                    } else tmem[((dst + byte) & mask) ^ swap] = v;
+                        destination=(((dst+offset)&mask)^swap)|bank;
+                    } else destination=((dst+byte)&mask)^swap;
+                    tmem[destination]=v;
+                    setFramebufferByte(destination,load,source);
                 }
                 if (block) {
                     dxtCounter += dxt;
@@ -86,6 +102,59 @@ namespace {
             if (!block) swap ^= 4;
         }
         ++tmemGeneration;
+    }
+    void FastRDP::setFramebufferByte(uint32_t address,uint32_t load,uint32_t source) {
+        const uint32_t old=tmemFramebuffer[address];
+        if(old!=load) {
+            if(old && !--framebufferLoads.at(old).references) framebufferLoads.erase(old);
+            if(load) ++framebufferLoads.at(load).references;
+            tmemFramebuffer[address]=load;
+        }
+        tmemSource[address]=source;
+    }
+    void FastRDP::materializeFramebufferTMEM(uint32_t load) {
+        const auto framebuffer=framebufferLoads.at(load).image;
+        auto bytes=std::make_shared<std::vector<uint8_t>>();
+        if(!state->sink.readFramebufferSnapshot(*framebuffer,*bytes)
+            || bytes->size()!=size_t(framebuffer->width)*framebuffer->height*framebuffer->colorBytes)
+            throw std::runtime_error("RT64 Fast cannot read framebuffer TMEM reinterpretation");
+        for(auto &entry:framebufferLoads) if(entry.second.image==framebuffer) entry.second.bytes=bytes;
+        for(unsigned i=0;i<tmem.size();++i)
+            if(tmemFramebuffer[i] && framebufferLoads.at(tmemFramebuffer[i]).image==framebuffer)
+                tmem[i]=bytes->at(tmemSource[i]-framebuffer->address);
+    }
+    uint8_t FastRDP::readTMEM(uint32_t address) {
+        address&=4095;
+        const uint32_t load=tmemFramebuffer[address];
+        if(load && !framebufferLoads.at(load).bytes) materializeFramebufferTMEM(load);
+        return tmem[address];
+    }
+    bool FastRDP::decodeFramebufferView(const FastTile &tile,FastTexture &texture) {
+        if(tile.fmt!=G_IM_FMT_RGBA || (tile.siz!=G_IM_SIZ_16b && tile.siz!=G_IM_SIZ_32b)) return false;
+        const uint32_t bpp=tile.siz==G_IM_SIZ_16b?2:4;
+        auto location=[&](unsigned x,unsigned y,unsigned byte) {
+            const uint32_t row=uint32_t(tile.tmem)*8+y*tile.line*8,swap=(y&1)*4;
+            if(bpp==4) return (((row+x*2+(byte&1))^swap)&2047) | ((byte&2)?2048:0);
+            return (((row+x*2)^swap)+byte)&4095;
+        };
+        const uint32_t first=location(0,0,0),load=tmemFramebuffer[first];
+        if(!load) return false;
+        const auto &fb=framebufferLoads.at(load).image;
+        if(fb->colorBytes!=bpp || !fb->texture || !fb->texture->storage || tmemSource[first]<fb->address) return false;
+        const uint32_t offset=tmemSource[first]-fb->address;
+        if(offset%bpp) return false;
+        const uint32_t x0=(offset/bpp)%fb->width,y0=(offset/bpp)/fb->width;
+        if(x0+texture.width>fb->width || y0+texture.height>fb->height) return false;
+        for(unsigned y=0;y<texture.height;++y) for(unsigned x=0;x<texture.width;++x) for(unsigned byte=0;byte<bpp;++byte) {
+            const uint32_t slot=location(x,y,byte),id=tmemFramebuffer[slot];
+            if(!id || framebufferLoads.at(id).image!=fb
+                || tmemSource[slot]!=tmemSource[first]+(y*fb->width+x)*bpp+byte) return false;
+        }
+        texture.storage=fb->texture->storage;
+        texture.storageX=fb->texture->storageX+x0; texture.storageY=fb->texture->storageY+y0;
+        const uint64_t key[]={fb->texture->hash,x0,y0,texture.width,texture.height};
+        texture.hash=XXH3_64bits(key,sizeof(key));
+        return true;
     }
     void FastRDP::loadTile(uint8_t tile, uint16_t uls, uint16_t ult, uint16_t lrs, uint16_t lrt) {
         if (lrs < uls || lrt < ult) throw std::runtime_error("RT64 Fast reversed tile load bounds");
@@ -119,18 +188,21 @@ namespace {
         out->width = t.masks && !(t.cms & G_TX_CLAMP) ? (1U << t.masks) : tileWidth;
         out->height = t.maskt && !(t.cmt & G_TX_CLAMP) ? (1U << t.maskt) : tileHeight;
         if (out->width > 1024 || out->height > 1024) throw std::runtime_error("RT64 Fast texture exceeds 1024 texels");
+        if(decodeFramebufferView(t,*out)) {
+            cached=out; decodedGenerations[tile]=generation; return out;
+        }
         out->rgba.resize(size_t(out->width) * out->height * 4);
-        auto u16 = [&](uint32_t a) { return uint16_t((uint16_t(tmem[a & 4095]) << 8) | tmem[(a+1) & 4095]); };
+        auto u16 = [&](uint32_t a) { return uint16_t((uint16_t(readTMEM(a)) << 8) | readTMEM(a+1)); };
         for (uint32_t y = 0; y < out->height; ++y) for (uint32_t x = 0; x < out->width; ++x) {
             const uint32_t row = uint32_t(t.tmem) * 8 + y * t.line * 8, swap = (y & 1) * 4;
             const uint32_t address = (row + (x << t.siz >> 1)) ^ swap;
-            const uint8_t byte = tmem[address & 4095];
+            const uint8_t byte = readTMEM(address);
             const uint8_t nibble = (byte >> ((x & 1) ? 0 : 4)) & 15;
             std::array<uint8_t, 4> pixel{};
             if (t.fmt == G_IM_FMT_RGBA && t.siz == G_IM_SIZ_16b) pixel = rgba16(u16(address));
             else if (t.fmt == G_IM_FMT_RGBA && t.siz == G_IM_SIZ_32b) {
                 const uint32_t a = ((row + x * 2) ^ swap) & 2047;
-                pixel = {tmem[a], tmem[(a+1) & 2047], tmem[a|2048], tmem[((a+1)&2047)|2048]};
+                pixel = {readTMEM(a),readTMEM((a+1)&2047),readTMEM(a|2048),readTMEM(((a+1)&2047)|2048)};
             } else if (t.fmt == G_IM_FMT_CI && (t.siz == G_IM_SIZ_4b || t.siz == G_IM_SIZ_8b)) {
                 const uint32_t index = t.siz == G_IM_SIZ_4b ? t.palette * 16 + nibble : byte;
                 const uint16_t entry = u16(2048 + index * 8);
@@ -147,7 +219,7 @@ namespace {
                 const uint8_t i = (byte >> 4) * 17;
                 pixel = {i,i,i,uint8_t((byte & 15) * 17)};
             } else if (t.fmt == G_IM_FMT_IA && t.siz == G_IM_SIZ_16b) {
-                pixel = {byte,byte,byte,tmem[(address+1)&4095]};
+                pixel = {byte,byte,byte,readTMEM(address+1)};
             } else throw std::runtime_error("RT64 Fast unsupported texture format/size");
             std::copy(pixel.begin(), pixel.end(), out->rgba.begin() + (size_t(y) * out->width + x) * 4);
         }
@@ -180,6 +252,7 @@ namespace {
     }
     FastDraw FastRDP::makeDraw(uint8_t tile, bool textured) {
         FastDraw draw = parameters;
+        draw.memoryEpoch=state->memoryEpoch;
         draw.otherMode = otherMode;
         if (textured) for (unsigned i = 0; i < 2; ++i) {
             const uint8_t index = (tile + i) & 7;

@@ -13,6 +13,9 @@
 #include "gbi/rt64_display_list.h"
 #include "hle/rt64_microcode.h"
 
+#ifdef RT64_LOG_PRINTF
+#undef RT64_LOG_PRINTF
+#endif
 #define RT64_LOG_PRINTF(...) do {} while (false)
 
 namespace RT64 {
@@ -97,6 +100,14 @@ namespace RT64 {
         FastDraw parameters;
         std::array<FastTile, 8> tiles{};
         std::array<uint8_t, 4096> tmem{};
+        struct FramebufferLoad {
+            std::shared_ptr<const FastFramebuffer> image;
+            std::shared_ptr<const std::vector<uint8_t>> bytes;
+            uint32_t references=0;
+        };
+        std::array<uint32_t,4096> tmemFramebuffer{},tmemSource{};
+        std::unordered_map<uint32_t,FramebufferLoad> framebufferLoads;
+        uint32_t nextFramebufferLoad=0;
         uint32_t textureAddress = 0, textureWidth = 0;
         uint8_t textureSize = 0, textureFormat = 0, colorSize = 2;
         uint32_t fillColor = 0;
@@ -104,6 +115,10 @@ namespace RT64 {
         uint64_t tmemGeneration = 0;
         std::array<std::shared_ptr<FastTexture>, 8> decodedTextures{};
         std::array<uint64_t, 8> decodedGenerations{};
+        void setFramebufferByte(uint32_t tmemAddress,uint32_t load,uint32_t source);
+        bool decodeFramebufferView(const FastTile &tile,FastTexture &texture);
+        void materializeFramebufferTMEM(uint32_t load);
+        uint8_t readTMEM(uint32_t address);
         std::vector<const DisplayList *> triPointerBuffer;
         std::vector<interop::float4> triPosWorkBuffer, triColWorkBuffer;
         std::vector<interop::float2> triTcWorkBuffer;
@@ -143,6 +158,7 @@ namespace RT64 {
         uint8_t *RDRAM;
         size_t rdramSize;
         FastDrawSink &sink;
+        uint64_t memoryEpoch=0;
         std::unique_ptr<FastRSP> rsp;
         std::unique_ptr<FastRDP> rdp;
         Microcode microcode{};
@@ -158,7 +174,7 @@ namespace RT64 {
         uint32_t readU32(uint32_t address) const;
         void pushReturnAddress(DisplayList *dl);
         DisplayList *popReturnAddress();
-        void flush() {} // Draws have already been consumed synchronously.
+        void flush() { sink.flushDraws(); }
         void fullSync() { sink.fullSync(); }
         void dpInterrupt() {} // The runtime owns task completion interrupts.
     };

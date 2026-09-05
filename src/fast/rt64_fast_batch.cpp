@@ -14,7 +14,7 @@ namespace {
         auto key=[](const FastDraw &d) {
             return std::tie(d.otherMode.L,d.otherMode.H,d.combine.L,d.combine.H,d.primitive,d.environment,
                 d.fogColor,d.blendColor,d.keyCenter,d.keyScale,d.lodFraction,d.k4,d.k5,
-                d.colorAddress,d.depthAddress,d.width,d.height,d.colorBytes,d.scissor,
+                d.colorAddress,d.depthAddress,d.memoryEpoch,d.width,d.height,d.colorBytes,d.scissor,
                 d.depthTest,d.depthWrite,d.fog,d.cullFront,d.cullBack,d.rectangle,d.fill,d.clearDepth,
                 d.fillColor,d.textures);
         };
@@ -46,10 +46,18 @@ namespace {
             } else pending.vertices.insert(pending.vertices.end(),draw.vertices.begin(),draw.vertices.end());
         }
         void fullSync() override { flush(); backend->fullSync(); }
+        void flushDraws() override { flush(); backend->flushDraws(); }
         void present(uint32_t address) override { flush(); backend->present(address); }
         void present(const VI &vi) override { flush(); backend->present(vi); }
         bool readFramebuffer(uint32_t address,uint32_t size,std::vector<uint8_t> &bytes) override {
             flush(); return backend->readFramebuffer(address,size,bytes);
+        }
+        void setRDRAM(const uint8_t *rdram,size_t size) override { flush(); backend->setRDRAM(rdram,size); }
+        std::shared_ptr<const FastFramebuffer> snapshotFramebuffer(uint32_t address,uint32_t size) override {
+            flush(); return backend->snapshotFramebuffer(address,size);
+        }
+        bool readFramebufferSnapshot(const FastFramebuffer &snapshot,std::vector<uint8_t> &bytes) override {
+            flush(); return backend->readFramebufferSnapshot(snapshot,bytes);
         }
     };
 }

@@ -47,6 +47,7 @@ namespace {
     void textureFunctions(std::ostringstream &s, unsigned i, bool filter) {
         s << "uniform sampler2D uTex" << i << ";\n"
           << "uniform vec2 uSize" << i << ";\n"
+          << "uniform vec2 uImageOrigin" << i << ", uImageSign" << i << ";\n"
           << "uniform vec4 uTile" << i << ";\n" // xy shifts, zw upper-left
           << "uniform vec2 uClamp" << i << ";\n" // negative disables clamp
           << "uniform vec2 uMask" << i << ";\n"
@@ -60,7 +61,7 @@ namespace {
           // for both the texel coordinate and the odd/even mirror period.
           << " if (period.x > 0.0) { float wraps = floor(p.x / period.x); float q = wraps - 2.0 * floor(wraps * 0.5); p.x -= wraps * period.x; if (uMirror" << i << ".x > 0.0 && q > 0.0) p.x = period.x - 1.0 - p.x; }\n"
           << " if (period.y > 0.0) { float wraps = floor(p.y / period.y); float q = wraps - 2.0 * floor(wraps * 0.5); p.y -= wraps * period.y; if (uMirror" << i << ".y > 0.0 && q > 0.0) p.y = period.y - 1.0 - p.y; }\n"
-          << " return texture2D(uTex" << i << ", (p + 0.5) / uSize" << i << ");\n}\n"
+          << " return texture2D(uTex" << i << ", (p * uImageSign" << i << " + uImageOrigin" << i << " + 0.5) / uSize" << i << ");\n}\n"
           << "vec4 sample" << i << "(vec2 uv) {\n"
           << " vec2 p = uv * uTile" << i << ".xy - uTile" << i << ".zw;\n";
         if (filter) {

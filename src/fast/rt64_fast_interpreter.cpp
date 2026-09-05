@@ -23,6 +23,7 @@ namespace RT64 {
             throw std::invalid_argument("RT64 Fast display-list address mismatch");
         }
         state->returnAddressStack.clear();
+        if(!++state->memoryEpoch) ++state->memoryEpoch;
         auto *dl = start;
         while (dl) {
             if (!budget--) throw std::runtime_error("RT64 Fast display-list command budget exceeded");
@@ -48,5 +49,6 @@ namespace RT64 {
             }
             if (dl) ++dl;
         }
+        state->flush();
     }
 }
