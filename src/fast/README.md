@@ -23,6 +23,13 @@ synchronize CPU framebuffer consumers and convert the guest's memory byte order.
 Host tests cover readback packing and ranges, but Vita3K's macOS Vulkan surface
 readback is a known validation limitation.
 
+VI presentation can also create a view from CPU-written RGBA16/32 RAM without a
+prior RDP draw. CPU edits reach subsequent scanouts, and those views do not claim
+GPU ownership. Reads of fully CPU-owned resident ranges return the original RAM
+bytes rather than round-tripping through the GPU. CPU-only views can be retired
+under cache pressure. This fallback uses the shared VI size estimate when its
+width matches the RAM stride; interlaced stride reinterpretation remains open.
+
 For an opt-in delayed-readback build, compile vitaGL with
 `READBACKS_SPEEDHACK=1` and configure RT64 with
 `-DRT64_FAST_READBACKS_SPEEDHACK=ON`. The matching RT64 option removes its explicit

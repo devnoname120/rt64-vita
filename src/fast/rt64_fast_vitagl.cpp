@@ -303,7 +303,7 @@ void main() {
             destination.syncVersion=contentVersion;
         }
         bool redundant(const Target &candidate) const {
-            if(!candidate.writeVersion) return true;
+            if(!candidate.writeVersion || !hasGpuBytes(candidate.address,endAddress(candidate))) return true;
             // Reads and snapshots need one view containing their whole range.
             // Coverage by several smaller views cannot replace that view.
             for(const auto &entry:targets) {
@@ -854,6 +854,14 @@ void main() {
             auto &t=*found;
             const uint32_t offset=address-t.address;
             synchronizeAliases(t);
+            // RAM is authoritative when no GPU draw owns any requested byte.
+            // Do not force CPU-only scanout through an unnecessary GPU readback.
+            if(rdram && uint64_t(address)+size<=rdramSize && !hasGpuBytes(address,uint64_t(address)+size)) {
+                bytes.resize(size);
+                for(uint32_t i=0;i<size;++i) bytes[i]=rdram[(address+i)^3];
+                glBindFramebuffer(GL_FRAMEBUFFER,0);
+                return true;
+            }
             return readPixels(t.fbo,t.width,t.height,t.colorBytes,offset,size,bytes);
         }
         bool readPixels(GLuint fbo,uint32_t width,uint32_t height,uint32_t colorBytes,uint32_t offset,uint32_t size,std::vector<uint8_t> &bytes) {
@@ -897,9 +905,9 @@ void main() {
             presentTarget(address,true,1.0f);
         }
         void present(const VI &vi) override {
-            presentTarget(vi.fbAddress(),vi.visible(),vi.gamma(),vi.width);
+            presentTarget(vi.fbAddress(),vi.visible(),vi.gamma(),vi.width,&vi);
         }
-        void presentTarget(uint32_t address,bool visible,float gamma,uint32_t width=0) {
+        void presentTarget(uint32_t address,bool visible,float gamma,uint32_t width=0,const VI *vi=nullptr) {
             // The VI origin includes the field's scanline offset (0x280 bytes
             // for a standard 320-wide RGBA16 image). Find the containing color
             // image rather than requiring its base address to equal the origin.
@@ -907,6 +915,23 @@ void main() {
             glDisable(GL_SCISSOR_TEST); glDisable(GL_DEPTH_TEST); glDisable(GL_CULL_FACE); glDisable(GL_BLEND); glDisable(GL_POLYGON_OFFSET_FILL);
             glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT);
             auto *found=findTarget(address,1,width);
+            if(!found && visible && vi && rdram && vi->width && vi->width<=1024
+                && vi->xTransform.xScale && vi->yTransform.yScale
+                && vi->hRegion.hEnd>vi->hRegion.hStart && vi->vRegion.vEnd>vi->vRegion.vStart
+                && (vi->status.type==VI_STATUS_TYPE_16_BIT || vi->status.type==VI_STATUS_TYPE_32_BIT)) {
+                const auto size=vi->fbSize();
+                const uint32_t colorBytes=vi->status.type==VI_STATUS_TYPE_16_BIT?2:4;
+                // Interlaced stride reinterpretation needs separate handling.
+                // Use the shared VI estimate only when it matches the RAM stride.
+                if(size.x==vi->width && size.y && size.y<=1024
+                    && uint64_t(address)+uint64_t(vi->width)*uint32_t(size.y)*colorBytes<=rdramSize) {
+                    FastDraw cpu;
+                    cpu.colorAddress=address; cpu.width=vi->width; cpu.height=size.y; cpu.colorBytes=colorBytes;
+                    // Empty draws select/merge a view without writing GPU bytes.
+                    draw(cpu);
+                    found=findTarget(address,1,width);
+                }
+            }
             if(!found) visible=false;
             if(visible) {
             synchronizeAliases(*found);
