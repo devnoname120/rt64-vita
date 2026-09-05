@@ -57,6 +57,17 @@ namespace {
         return program;
     }
     void enabled(GLenum cap, bool value) { if (value) glEnable(cap); else glDisable(cap); }
+    void useDrawProgram(GLuint program) {
+#ifdef RT64_FAST_VITAGL
+        // vitaGL dirties every shader constant on every glUseProgram call.
+        // Query its actual binding so internal blits and external GL users
+        // cannot leave an application-side binding cache out of date.
+        GLint current=0;
+        glGetIntegerv(GL_CURRENT_PROGRAM,&current);
+        if(GLuint(current)==program) return;
+#endif
+        glUseProgram(program);
+    }
     struct Target {
         GLuint fbo=0,texture=0;
         uint32_t address=0;
@@ -87,11 +98,34 @@ namespace {
         ~ImageStorage() override { if(auto owner=pool.lock()) owner->release(texture); }
     };
     struct CachedTexture { GLuint id=0; uint32_t width=0,height=0; uint64_t used=0; };
-    struct TextureUniforms { GLint sampler=-1,size=-1,origin=-1,sign=-1,tile=-1,clamp=-1,mask=-1,mirror=-1; };
+    template<size_t Count> struct FloatUniform {
+        GLint location=-1;
+        std::array<float,Count> value{};
+        bool initialized=false;
+        FloatUniform(GLint location=-1) : location(location) {}
+        void set(const float *next) {
+            // vitaGL uses opaque pointer-valued locations, so only -1 denotes
+            // an absent uniform. Keep values per program, including zero and
+            // signed-zero bit patterns, across temporary program switches.
+            if(location==-1 || (initialized && !std::memcmp(value.data(),next,Count*sizeof(float)))) return;
+            std::copy_n(next,Count,value.data()); initialized=true;
+            if constexpr(Count==1) glUniform1f(location,next[0]);
+            else if constexpr(Count==2) glUniform2f(location,next[0],next[1]);
+            else if constexpr(Count==3) glUniform3fv(location,1,next);
+            else if constexpr(Count==4) glUniform4fv(location,1,next);
+        }
+        void set(float x,float y=0,float z=0,float w=0) { const float next[]={x,y,z,w}; set(next); }
+    };
+    struct TextureUniforms {
+        GLint sampler=-1;
+        FloatUniform<2> size,origin,sign,clamp,mask,mirror;
+        FloatUniform<4> tile;
+    };
     struct Program {
         GLuint id=0;
-        GLint primitive=-1,environment=-1,fogColor=-1,blendColor=-1,fillColor=-1;
-        GLint keyCenter=-1,keyScale=-1,lodFraction=-1,k4=-1,k5=-1,frame=-1;
+        FloatUniform<4> primitive,environment,fogColor,blendColor,fillColor;
+        FloatUniform<3> keyCenter,keyScale;
+        FloatUniform<1> lodFraction,k4,k5,frame;
         std::array<TextureUniforms,2> textures{};
     };
     Program makeProgram(GLuint vs,const std::string &source) {
@@ -600,9 +634,9 @@ void main() { gl_FragColor = vec4(0.0); }
             }
             glDrawArrays(GL_TRIANGLES,0,v.size());
         }
-        void bindTexture(const Program &program, unsigned index, const FastDraw &draw) {
+        void bindTexture(Program &program, unsigned index, const FastDraw &draw) {
             if(!draw.textures[index]) return;
-            const auto &uniform=program.textures[index];
+            auto &uniform=program.textures[index];
             if(uniform.sampler==-1) return;
             const auto &image=*draw.textures[index];
             glActiveTexture(GL_TEXTURE0+index);
@@ -610,9 +644,9 @@ void main() { gl_FragColor = vec4(0.0); }
                 const auto *gpu=dynamic_cast<const ImageStorage *>(image.storage.get());
                 if(!gpu || gpu->pool.lock()!=imagePool) throw std::runtime_error("RT64 Fast GPU texture belongs to another renderer");
                 glBindTexture(GL_TEXTURE_2D,gpu->texture);
-                glUniform2f(uniform.size,gpu->width,gpu->height);
-                glUniform2f(uniform.origin,image.storageX,gpu->invertedY?gpu->height-1-image.storageY:image.storageY);
-                glUniform2f(uniform.sign,1,gpu->invertedY?-1:1);
+                uniform.size.set(gpu->width,gpu->height);
+                uniform.origin.set(image.storageX,gpu->invertedY?gpu->height-1-image.storageY:image.storageY);
+                uniform.sign.set(1,gpu->invertedY?-1:1);
             } else {
               auto key=std::make_tuple(image.hash,image.width,image.height);
               auto &t=textures[key];
@@ -637,16 +671,16 @@ void main() { gl_FragColor = vec4(0.0); }
                 t.width=image.width; t.height=image.height; textureBytes+=image.rgba.size();
               } else glBindTexture(GL_TEXTURE_2D,t.id);
               t.used=frame;
-              glUniform2f(uniform.size,image.width,image.height);
-              glUniform2f(uniform.origin,0,0); glUniform2f(uniform.sign,1,1);
+              uniform.size.set(image.width,image.height);
+              uniform.origin.set(0,0); uniform.sign.set(1,1);
             }
             const auto &tile=draw.tiles[index];
             auto shift=[](unsigned value){return value<=10 ? 1.0f/float(1U<<value) : float(1U<<(16-value));};
-            glUniform4f(uniform.tile,shift(tile.shifts),shift(tile.shiftt),tile.uls/4.0f,tile.ult/4.0f);
-            glUniform2f(uniform.clamp,(tile.cms&G_TX_CLAMP)||!tile.masks ? ((tile.lrs-tile.uls)&4095)/4.0f : -1,
+            uniform.tile.set(shift(tile.shifts),shift(tile.shiftt),tile.uls/4.0f,tile.ult/4.0f);
+            uniform.clamp.set((tile.cms&G_TX_CLAMP)||!tile.masks ? ((tile.lrs-tile.uls)&4095)/4.0f : -1,
                 (tile.cmt&G_TX_CLAMP)||!tile.maskt ? ((tile.lrt-tile.ult)&4095)/4.0f : -1);
-            glUniform2f(uniform.mask,tile.masks ? float(1U<<tile.masks) : 0,tile.maskt ? float(1U<<tile.maskt) : 0);
-            glUniform2f(uniform.mirror,tile.cms&G_TX_MIRROR ? 1:0,tile.cmt&G_TX_MIRROR ? 1:0);
+            uniform.mask.set(tile.masks ? float(1U<<tile.masks) : 0,tile.maskt ? float(1U<<tile.maskt) : 0);
+            uniform.mirror.set(tile.cms&G_TX_MIRROR ? 1:0,tile.cmt&G_TX_MIRROR ? 1:0);
         }
     public:
         explicit FastGLSink(std::function<void()> swap) : swapBuffers(std::move(swap)) {
@@ -719,7 +753,7 @@ void main() {
 #ifdef RT64_FAST_VITAGL
                 const auto &p=found->second;
                 sceClibPrintf("RT64 sampler locations program=%u tex0=%d tex1=%d size0=%d size1=%d\n",p.id,
-                    p.textures[0].sampler,p.textures[1].sampler,p.textures[0].size,p.textures[1].size);
+                    p.textures[0].sampler,p.textures[1].sampler,p.textures[0].size.location,p.textures[1].size.location);
 #endif
 #ifdef RT64_FAST_VITAGL
                 sceClibPrintf(
@@ -733,17 +767,17 @@ void main() {
                     v.color[0],v.color[1],v.color[2],v.color[3],v.fog,d.fogColor[0],d.fogColor[1],d.fogColor[2]);
 #endif
             }
-            const auto &program=found->second;
-            glUseProgram(program.id);
-            glUniform4fv(program.primitive,1,d.primitive.data());
-            glUniform4fv(program.environment,1,d.environment.data());
-            glUniform4fv(program.fogColor,1,d.fogColor.data());
-            glUniform4fv(program.blendColor,1,d.blendColor.data());
-            glUniform4fv(program.fillColor,1,d.fillColor.data());
-            glUniform3fv(program.keyCenter,1,d.keyCenter.data());
-            glUniform3fv(program.keyScale,1,d.keyScale.data());
-            glUniform1f(program.lodFraction,d.lodFraction);
-            glUniform1f(program.k4,d.k4); glUniform1f(program.k5,d.k5); glUniform1f(program.frame,frame%1024);
+            auto &program=found->second;
+            useDrawProgram(program.id);
+            program.primitive.set(d.primitive.data());
+            program.environment.set(d.environment.data());
+            program.fogColor.set(d.fogColor.data());
+            program.blendColor.set(d.blendColor.data());
+            program.fillColor.set(d.fillColor.data());
+            program.keyCenter.set(d.keyCenter.data());
+            program.keyScale.set(d.keyScale.data());
+            program.lodFraction.set(d.lodFraction);
+            program.k4.set(d.k4); program.k5.set(d.k5); program.frame.set(frame%1024);
             for(unsigned i=0;i<2;++i) bindTexture(program,i,d);
             enabled(GL_DEPTH_TEST,d.depthTest||d.depthWrite);
             glDepthFunc(d.depthTest?GL_LEQUAL:GL_ALWAYS); glDepthMask(d.depthWrite?GL_TRUE:GL_FALSE);

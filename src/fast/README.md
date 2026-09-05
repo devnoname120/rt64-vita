@@ -26,6 +26,13 @@ is compiled normally. This avoids repeat compilation stalls, but new shader
 combinations still compile on first use; it does not improve steady-state draw
 throughput or replace framebuffer synchronization.
 
+Combiner programs retain the last submitted float uniform values and skip
+unchanged values and absent uniforms. The cache is per program and preserves
+bit patterns, including signed zero. On vitaGL, draw submission queries the
+actual bound program before rebinding it: a redundant `glUseProgram` otherwise
+marks every constant dirty again. Internal blits and external GL program
+changes are therefore observed without relying on a stale binding cache.
+
 The interface supports triangles/rectangles, generated color combiners, batched
 draws, VI visibility/gamma/field addressing, and explicit color-image readback.
 Readback returns top-to-bottom bytes in N64 RGBA16/RGBA32 order; integration must
