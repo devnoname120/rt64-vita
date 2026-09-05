@@ -21,13 +21,6 @@
 
 namespace RT64 {
 namespace {
-    void clearDepth(float depth) {
-#ifdef RT64_FAST_VITAGL
-        glClearDepth(depth);
-#else
-        glClearDepthf(depth);
-#endif
-    }
     GLuint compile(GLenum type, const std::string &source) {
         GLuint shader = glCreateShader(type);
         const char *text = source.c_str();
@@ -65,14 +58,17 @@ namespace {
     }
     void enabled(GLenum cap, bool value) { if (value) glEnable(cap); else glDisable(cap); }
     struct Target {
-        GLuint fbo=0,texture=0,depth=0;
-        uint32_t width=0,height=0,depthAddress=0,colorBytes=2;
+        GLuint fbo=0,texture=0;
+        uint32_t width=0,height=0,colorBytes=2;
         std::weak_ptr<const FastFramebuffer> snapshot;
         uint64_t memoryEpoch=0;
         uint32_t shadowAddress=0;
         std::vector<uint8_t> memoryShadow;
         GLuint memoryScratch=0;
         bool memoryWatched=false;
+    };
+    struct DepthTarget {
+        GLuint fbo=0,depth=0,placeholder=0,attachedColor=0;
     };
     struct ImagePool {
         std::map<GLuint,GLuint> images;
@@ -122,6 +118,8 @@ namespace {
         // particularly expensive on the Vita CPU.
         using ShaderKey=std::array<uint32_t,4>;
         std::map<uint32_t, Target> targets;
+        using DepthKey=std::tuple<uint32_t,uint32_t,uint32_t>; // Address, width, height.
+        std::map<DepthKey,DepthTarget> depthTargets;
         std::shared_ptr<ImagePool> imagePool=std::make_shared<ImagePool>();
         uint64_t snapshotSerial=0;
         const uint8_t *rdram=nullptr;
@@ -133,6 +131,7 @@ namespace {
         GLuint vbo=0, blit=0, vertexShader=0;
         GLint blitGamma=-1,blitQuantize=-1;
         GLuint memoryMerge=0,memoryPixels=0,memoryMask=0;
+        GLuint depthClearProgram=0;
         GLint memoryColorBytes=-1;
         std::function<void()> swapBuffers;
         std::function<void(uint32_t,uint32_t,bool)> watchMemory;
@@ -249,15 +248,80 @@ void main() {
             t.memoryShadow=std::move(memory);
         }
 
+        void bindDepthTarget(DepthTarget &depth,GLuint texture) {
+            glBindFramebuffer(GL_FRAMEBUFFER,depth.fbo);
+            if(depth.attachedColor!=texture) {
+                glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,texture,0);
+                depth.attachedColor=texture;
+            }
+        }
+        DepthTarget &depthTarget(uint32_t address,uint32_t width,uint32_t height) {
+            auto &depth=depthTargets[{address,width,height}];
+            if(!depth.fbo) {
+                if(depthTargets.size()>16) throw std::runtime_error("RT64 Fast depth image limit exceeded");
+                // vitaGL owns the actual depth allocation in the FBO, not the
+                // renderbuffer handle. Keep one FBO per depth image and switch
+                // its color attachment without reallocating its hidden depth.
+                glGenTextures(1,&depth.placeholder); glBindTexture(GL_TEXTURE_2D,depth.placeholder);
+                glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+                glGenRenderbuffers(1,&depth.depth); glBindRenderbuffer(GL_RENDERBUFFER,depth.depth);
+                glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT16,width,height);
+                glGenFramebuffers(1,&depth.fbo); bindDepthTarget(depth,depth.placeholder);
+                glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,depth.depth);
+                if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)
+                    throw std::runtime_error("RT64 Fast depth framebuffer is incomplete");
+                clearDepthTarget(depth,width,height,{0,0,int(width),int(height)});
+            }
+            return depth;
+        }
+        void clearDepthTarget(DepthTarget &depth,uint32_t width,uint32_t height,std::array<int,4> bounds) {
+            bounds[0]=std::clamp(bounds[0],0,int(width)); bounds[2]=std::clamp(bounds[2],0,int(width));
+            bounds[1]=std::clamp(bounds[1],0,int(height)); bounds[3]=std::clamp(bounds[3],0,int(height));
+            if(bounds[2]<=bounds[0] || bounds[3]<=bounds[1]) return;
+            if(!depthClearProgram) depthClearProgram=link(vertexShader,R"(#version 100
+precision highp float;
+void main() { gl_FragColor = vec4(0.0); }
+)");
+            // A normal draw keeps the fragment stage active and implements the
+            // exact clear rectangle without depending on vitaGL's mask-based
+            // scissored glClear path. Color writes affect only the placeholder.
+            bindDepthTarget(depth,depth.placeholder);
+            glViewport(0,0,width,height); glDisable(GL_SCISSOR_TEST);
+            glDisable(GL_BLEND); glDisable(GL_CULL_FACE); glDisable(GL_POLYGON_OFFSET_FILL);
+            glEnable(GL_DEPTH_TEST); glDepthFunc(GL_ALWAYS); glDepthMask(GL_TRUE);
+            glUseProgram(depthClearProgram);
+            const float left=float(bounds[0])*2/width-1,right=float(bounds[2])*2/width-1;
+            const float top=1-float(bounds[1])*2/height,bottom=1-float(bounds[3])*2/height;
+            const float xy[6][2]={{left,bottom},{right,bottom},{right,top},{left,bottom},{right,top},{left,top}};
+            std::vector<FastVertex> quad(6);
+            for(unsigned i=0;i<6;++i) {
+                quad[i].position[0]=xy[i][0]; quad[i].position[1]=xy[i][1]; quad[i].position[2]=1;
+            }
+            vertices(quad);
+            if(glGetError()!=GL_NO_ERROR) throw std::runtime_error("RT64 Fast depth clear failed");
+        }
+        void destroyDepthTargets() {
+            for(auto &entry:depthTargets) {
+                auto &depth=entry.second;
+                if(depth.fbo) glDeleteFramebuffers(1,&depth.fbo);
+                if(depth.depth) glDeleteRenderbuffers(1,&depth.depth);
+                if(depth.placeholder) glDeleteTextures(1,&depth.placeholder);
+            }
+            depthTargets.clear();
+        }
         Target &target(const FastDraw &draw) {
             if(draw.colorBytes!=2 && draw.colorBytes!=4) throw std::runtime_error("RT64 Fast invalid framebuffer pixel size");
             auto &t=targets[draw.colorAddress];
-            if (t.fbo && (t.width != draw.width || t.height != draw.height || t.depthAddress != draw.depthAddress || t.colorBytes != draw.colorBytes)) {
+            if (t.fbo && (t.width != draw.width || t.height != draw.height || t.colorBytes != draw.colorBytes)) {
                 destroyTarget(t,draw.colorAddress); t={};
             }
             if (!t.fbo) {
                 if (targets.size() > 16) throw std::runtime_error("RT64 Fast framebuffer limit exceeded");
-                t.width=draw.width; t.height=draw.height; t.depthAddress=draw.depthAddress;
+                t.width=draw.width; t.height=draw.height;
                 t.colorBytes=draw.colorBytes;
                 captureMemory(t,draw.colorAddress);
                 const auto pixels=initialPixels(t,draw.colorAddress);
@@ -267,15 +331,12 @@ void main() {
                 glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
                 glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
-                glGenRenderbuffers(1,&t.depth); glBindRenderbuffer(GL_RENDERBUFFER,t.depth);
-                glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT16,t.width,t.height);
                 glGenFramebuffers(1,&t.fbo); glBindFramebuffer(GL_FRAMEBUFFER,t.fbo);
                 glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,t.texture,0);
-                glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,t.depth);
                 if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
                     throw std::runtime_error("RT64 Fast framebuffer is incomplete");
-                glDisable(GL_SCISSOR_TEST); glDepthMask(GL_TRUE);
-                glClearColor(0,0,0,1); clearDepth(1); glClear(GL_DEPTH_BUFFER_BIT|(pixels.empty()?GL_COLOR_BUFFER_BIT:0));
+                glDisable(GL_SCISSOR_TEST);
+                if(pixels.empty()) { glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT); }
                 if(watchMemory) {
                     watchMemory(draw.colorAddress,t.width*t.height*t.colorBytes,true); t.memoryWatched=true;
                 }
@@ -283,19 +344,26 @@ void main() {
             if(!draw.memoryEpoch || t.memoryEpoch!=draw.memoryEpoch) {
                 synchronizeMemory(t,draw.colorAddress); t.memoryEpoch=draw.memoryEpoch;
             }
-            glBindFramebuffer(GL_FRAMEBUFFER,t.fbo);
+            if(draw.depthTest || draw.depthWrite) {
+                auto &depth=depthTarget(draw.depthAddress,draw.width,draw.height);
+                bindDepthTarget(depth,t.texture);
+            } else glBindFramebuffer(GL_FRAMEBUFFER,t.fbo);
             glViewport(0,0,t.width,t.height);
             t.snapshot.reset();
             return t;
         }
         void destroyTarget(Target &t,uint32_t address) {
             if(t.memoryWatched) { watchMemory(address,t.width*t.height*t.colorBytes,false); t.memoryWatched=false; }
+            for(auto &entry:depthTargets) {
+                auto &depth=entry.second;
+                if(depth.attachedColor==t.texture || (t.memoryScratch && depth.attachedColor==t.memoryScratch))
+                    bindDepthTarget(depth,depth.placeholder);
+            }
             if(t.fbo) glDeleteFramebuffers(1,&t.fbo);
             if(t.texture) glDeleteTextures(1,&t.texture);
-            if(t.depth) glDeleteRenderbuffers(1,&t.depth);
             if(t.memoryScratch) glDeleteTextures(1,&t.memoryScratch);
         }
-        void scissor(const FastDraw &d, bool rectangleBounds=false) {
+        std::array<int,4> scissorBounds(const FastDraw &d,bool rectangleBounds=false) {
             int left=d.scissor[0]/4, top=d.scissor[1]/4, right=(d.scissor[2]+3)/4, bottom=(d.scissor[3]+3)/4;
             if (rectangleBounds && !d.vertices.empty()) {
                 float minX=1,minY=1,maxX=-1,maxY=-1;
@@ -308,8 +376,12 @@ void main() {
                 top=std::max(top,int(std::lround((1-maxY)*d.height/2)));
                 bottom=std::min(bottom,int(std::lround((1-minY)*d.height/2)));
             }
+            return {left,top,right,bottom};
+        }
+        void scissor(const FastDraw &d,bool rectangleBounds=false) {
+            const auto bounds=scissorBounds(d,rectangleBounds);
             glEnable(GL_SCISSOR_TEST);
-            glScissor(left,int(d.height)-bottom,std::max(0,right-left),std::max(0,bottom-top));
+            glScissor(bounds[0],int(d.height)-bounds[3],std::max(0,bounds[2]-bounds[0]),std::max(0,bounds[3]-bounds[1]));
         }
         void vertices(const std::vector<FastVertex> &v) {
             glBindBuffer(GL_ARRAY_BUFFER,vbo);
@@ -405,6 +477,7 @@ void main() {
             glFinish();
             imagePool->clear(); imagePool.reset();
             for(auto &pair:targets) destroyTarget(pair.second,pair.first);
+            destroyDepthTargets();
             for(auto &pair:programs) glDeleteProgram(pair.second.id);
             glDeleteShader(vertexShader);
             for(auto &pair:textures) glDeleteTextures(1,&pair.second.id);
@@ -412,15 +485,12 @@ void main() {
             if(memoryMerge) glDeleteProgram(memoryMerge);
             if(memoryPixels) glDeleteTextures(1,&memoryPixels);
             if(memoryMask) glDeleteTextures(1,&memoryMask);
+            if(depthClearProgram) glDeleteProgram(depthClearProgram);
         }
         void draw(const FastDraw &d) override {
             if(d.clearDepth) {
-                // A cleared N64 depth image can be shared by multiple color
-                // images. Clear every resident target that references it.
-                for(auto &pair:targets) if(pair.second.depthAddress==d.colorAddress) {
-                    glBindFramebuffer(GL_FRAMEBUFFER,pair.second.fbo);
-                    scissor(d,true); glDepthMask(GL_TRUE); clearDepth(1); glClear(GL_DEPTH_BUFFER_BIT);
-                }
+                auto &depth=depthTarget(d.colorAddress,d.width,d.height);
+                clearDepthTarget(depth,d.width,d.height,scissorBounds(d,true));
                 return;
             }
             target(d); scissor(d);
@@ -474,7 +544,11 @@ void main() {
         void fullSync() override { glFlush(); }
         void setRDRAM(const uint8_t *memory,size_t size) override {
             if(memory==rdram && size==rdramSize) return;
-            if(!targets.empty()) { glFinish(); for(auto &entry:targets) destroyTarget(entry.second,entry.first); targets.clear(); }
+            if(!targets.empty() || !depthTargets.empty()) {
+                glFinish();
+                for(auto &entry:targets) destroyTarget(entry.second,entry.first);
+                targets.clear(); destroyDepthTargets();
+            }
             rdram=memory; rdramSize=size;
         }
         void setMemoryWriteTracking(std::function<void(uint32_t,uint32_t,bool)> watch) override {
@@ -562,32 +636,31 @@ void main() {
         }
         bool readPixels(GLuint fbo,uint32_t width,uint32_t height,uint32_t colorBytes,uint32_t offset,uint32_t size,std::vector<uint8_t> &bytes) {
             const uint64_t end=uint64_t(offset)+size;
-            const Target t{fbo,0,0,width,height,0,colorBytes,{}};
-            const uint32_t firstPixel=offset/t.colorBytes,lastPixel=(end-1)/t.colorBytes;
-            const uint32_t firstRow=firstPixel/t.width,lastRow=lastPixel/t.width;
+            const uint32_t firstPixel=offset/colorBytes,lastPixel=(end-1)/colorBytes;
+            const uint32_t firstRow=firstPixel/width,lastRow=lastPixel/width;
             const uint32_t rows=lastRow-firstRow+1;
-            std::vector<uint8_t> rgba(size_t(t.width)*rows*4);
-            glBindFramebuffer(GL_FRAMEBUFFER,t.fbo);
+            std::vector<uint8_t> rgba(size_t(width)*rows*4);
+            glBindFramebuffer(GL_FRAMEBUFFER,fbo);
 #ifndef RT64_FAST_VITAGL
             glPixelStorei(GL_PACK_ALIGNMENT,1);
 #endif
             // vitaGL always packs RGBA8 rows contiguously and does not expose
             // GL_PACK_ALIGNMENT through glPixelStorei.
             glFinish();
-            glReadPixels(0,t.height-lastRow-1,t.width,rows,GL_RGBA,GL_UNSIGNED_BYTE,rgba.data());
+            glReadPixels(0,height-lastRow-1,width,rows,GL_RGBA,GL_UNSIGNED_BYTE,rgba.data());
             if(glGetError()!=GL_NO_ERROR) throw std::runtime_error("RT64 Fast framebuffer readback failed");
             bytes.resize(size);
             for(uint32_t pixel=firstPixel;pixel<=lastPixel;++pixel) {
-                const uint32_t row=pixel/t.width-firstRow,col=pixel%t.width;
-                const auto *color=&rgba[((rows-row-1)*t.width+col)*4];
+                const uint32_t row=pixel/width-firstRow,col=pixel%width;
+                const auto *color=&rgba[((rows-row-1)*width+col)*4];
                 uint8_t packed[4];
-                if(t.colorBytes==2) {
+                if(colorBytes==2) {
                     const uint16_t value=(uint16_t(color[0]>>3)<<11)|(uint16_t(color[1]>>3)<<6)
                         |(uint16_t(color[2]>>3)<<1)|(color[3]>=128);
                     packed[0]=value>>8; packed[1]=value;
                 } else std::copy_n(color,4,packed);
-                for(uint32_t b=0;b<t.colorBytes;++b) {
-                    const uint32_t pos=pixel*t.colorBytes+b;
+                for(uint32_t b=0;b<colorBytes;++b) {
+                    const uint32_t pos=pixel*colorBytes+b;
                     if(pos>=offset && pos<end) bytes[pos-offset]=packed[b];
                 }
             }

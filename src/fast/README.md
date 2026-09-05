@@ -13,7 +13,8 @@ ctest --test-dir build-fast --no-tests=error --output-on-failure
 
 `RT64_FAST_VITAGL=ON` selects the Vita backend; `RT64_FAST_GLES2=ON` selects host
 GLES2. They are mutually exclusive. The Vita build needs vitaGL, vitaShaRK and
-the VitaSDK toolchain. Use vitaGL's `NO_SPLASHSCREEN=1` option for Vita3K.
+the VitaSDK toolchain. Build vitaGL with `NO_SPLASHSCREEN=1` for Vita3K and
+`STORE_DEPTH_STENCIL=1` to preserve depth across GPU scenes.
 
 The interface supports triangles/rectangles, generated color combiners, batched
 draws, VI visibility/gamma/field addressing, and explicit color-image readback.
@@ -38,6 +39,14 @@ those records, including same-value stores, without modifying earlier snapshots.
 Flush earlier work before delivering writes at graphics task/readback/presentation
 boundaries. RAM comparison remains a fallback for writes that were not reported.
 Overlapping GPU framebuffer aliases still require further work.
+
+Color storage is independent of depth surfaces. Draws with the same depth address
+and dimensions share one persistent depth FBO, switching its color attachment as
+needed. This also works with vitaGL, whose renderbuffer handles do not own shared
+depth storage. Changing the depth image preserves color; switching back restores
+the previous depth values. Far-depth clears use clipped rectangle draws into a
+private color attachment, avoiding the tested vitaGL/Vita3K depth-only clear issue.
+Different-size depth interpretations and color/depth memory aliasing remain open.
 
 This is a reduced renderer under development, not full RT64 compatibility.
 General framebuffer coherence, remaining VI stride/scaling, extended GBI and unsupported
