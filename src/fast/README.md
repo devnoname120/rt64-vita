@@ -8,7 +8,7 @@ draw and shader code in host tests. The default desktop renderer is unchanged.
 ```sh
 cmake -S . -B build-fast -DRT64_FAST=ON -DRT64_FAST_TESTS=ON
 cmake --build build-fast
-ctest --test-dir build-fast --output-on-failure
+ctest --test-dir build-fast --no-tests=error --output-on-failure
 ```
 
 `RT64_FAST_VITAGL=ON` selects the Vita backend; `RT64_FAST_GLES2=ON` selects host

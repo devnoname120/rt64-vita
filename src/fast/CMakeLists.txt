@@ -1,6 +1,5 @@
 option(RT64_FAST_VITAGL "Build the vitaGL draw backend" OFF)
 option(RT64_FAST_GLES2 "Build the same draw path against host GLES2 for validation" OFF)
-option(RT64_FAST_TESTS "Build the portable renderer tests" OFF)
 option(RT64_FAST_VALIDATE_UPLOADS "Validate vitaGL texture uploads against CPU data" OFF)
 
 add_library(rt64 STATIC
