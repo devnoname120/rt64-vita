@@ -646,7 +646,11 @@ void main() {
 #endif
             // vitaGL always packs RGBA8 rows contiguously and does not expose
             // GL_PACK_ALIGNMENT through glPixelStorei.
+            // An explicit wait would defeat vitaGL's optional delayed-readback
+            // mode. Normal builds retain their existing synchronization.
+#if !defined(RT64_FAST_VITAGL) || !defined(RT64_FAST_READBACKS_SPEEDHACK)
             glFinish();
+#endif
             glReadPixels(0,height-lastRow-1,width,rows,GL_RGBA,GL_UNSIGNED_BYTE,rgba.data());
             if(glGetError()!=GL_NO_ERROR) throw std::runtime_error("RT64 Fast framebuffer readback failed");
             bytes.resize(size);

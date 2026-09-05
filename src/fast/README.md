@@ -23,6 +23,13 @@ synchronize CPU framebuffer consumers and convert the guest's memory byte order.
 Host tests cover readback packing and ranges, but Vita3K's macOS Vulkan surface
 readback is a known validation limitation.
 
+For an opt-in delayed-readback build, compile vitaGL with
+`READBACKS_SPEEDHACK=1` and configure RT64 with
+`-DRT64_FAST_READBACKS_SPEEDHACK=ON`. The matching RT64 option removes its explicit
+`glFinish` immediately before `glReadPixels`, so it does not defeat vitaGL's
+speedhack. Normal builds keep the wait. This mode can return earlier frame data;
+its effect on game performance and readback-dependent effects needs device tests.
+
 Framebuffer texture loads retain TMEM byte provenance and immutable GPU snapshots.
 Compatible RGBA16/32 rectangles sample the captured image directly, including
 subregions, split load/render tiles and RGBA32 TMEM banks. Later draws cannot

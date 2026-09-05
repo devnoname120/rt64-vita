@@ -1,6 +1,7 @@
 option(RT64_FAST_VITAGL "Build the vitaGL draw backend" OFF)
 option(RT64_FAST_GLES2 "Build the same draw path against host GLES2 for validation" OFF)
 option(RT64_FAST_VALIDATE_UPLOADS "Validate vitaGL texture uploads against CPU data" OFF)
+option(RT64_FAST_READBACKS_SPEEDHACK "Allow delayed readbacks with a matching vitaGL READBACKS_SPEEDHACK build" OFF)
 
 add_library(rt64 STATIC
     rt64_fast_state.cpp
@@ -38,6 +39,9 @@ if(RT64_FAST_VITAGL OR RT64_FAST_GLES2)
 endif()
 if(RT64_FAST_VITAGL)
     target_compile_definitions(rt64 PUBLIC RT64_FAST_VITAGL)
+    if(RT64_FAST_READBACKS_SPEEDHACK)
+        set_property(SOURCE rt64_fast_vitagl.cpp APPEND PROPERTY COMPILE_DEFINITIONS RT64_FAST_READBACKS_SPEEDHACK)
+    endif()
     target_link_libraries(rt64 PUBLIC vitaGL vitashark SceShaccCgExt
         taihen_stub mathneon SceGxm_stub SceDisplay_stub SceSysmodule_stub SceAppMgr_stub SceCommonDialog_stub
         SceShaccCg_stub SceKernelDmacMgr_stub)
