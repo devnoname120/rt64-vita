@@ -310,7 +310,11 @@ void main() {
             const uint32_t rows=lastRow-firstRow+1;
             std::vector<uint8_t> rgba(size_t(t.width)*rows*4);
             glBindFramebuffer(GL_FRAMEBUFFER,t.fbo);
+#ifndef RT64_FAST_VITAGL
             glPixelStorei(GL_PACK_ALIGNMENT,1);
+#endif
+            // vitaGL always packs RGBA8 rows contiguously and does not expose
+            // GL_PACK_ALIGNMENT through glPixelStorei.
             glFinish();
             glReadPixels(0,t.height-lastRow-1,t.width,rows,GL_RGBA,GL_UNSIGNED_BYTE,rgba.data());
             if(glGetError()!=GL_NO_ERROR) throw std::runtime_error("RT64 Fast framebuffer readback failed");
