@@ -4,6 +4,10 @@
 
 #pragma once
 
+#ifdef RT64_FAST
+#include "fast/rt64_fast_state.h"
+#else
+
 #include "xxHash/xxh3.h"
 
 #include "common/rt64_emulator_configuration.h"
@@ -175,3 +179,4 @@ namespace RT64 {
         void updateRenderFlagSampleCount();
     };
 };
+#endif

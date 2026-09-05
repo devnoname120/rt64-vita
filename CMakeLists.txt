@@ -3,6 +3,14 @@ project(rt64 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
+# The Fast renderer shares the N64 command decoders, but uses CPU vertex/TMEM
+# processing and a GLES2/vitaGL draw path. It does not require the modern RHI.
+option(RT64_FAST "Build the reduced Fast3D renderer" OFF)
+if (RT64_FAST)
+    add_subdirectory(src/fast)
+    return()
+endif()
+
 if (APPLE)
     enable_language(OBJC OBJCXX)
     set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15")
@@ -556,4 +564,3 @@ build_pixel_shader(  rt64 "src/shaders/Im3DPS.hlsl")
 build_pixel_shader(  rt64 "src/shaders/PostProcessPS.hlsl")
 
 target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/src)
-

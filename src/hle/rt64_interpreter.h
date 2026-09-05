@@ -4,6 +4,10 @@
 
 #pragma once
 
+#ifdef RT64_FAST
+#include "fast/rt64_fast_interpreter.h"
+#else
+
 #include "rt64_state.h"
 
 #include "gbi/rt64_f3d.h"
@@ -29,3 +33,4 @@ namespace RT64 {
         void processDisplayLists(uint32_t dlStartAdddress, DisplayList *dlStart);
     };
 };
+#endif
