@@ -16,6 +16,16 @@ GLES2. They are mutually exclusive. The Vita build needs vitaGL, vitaShaRK and
 the VitaSDK toolchain. Build vitaGL with `NO_SPLASHSCREEN=1` for Vita3K and
 `STORE_DEPTH_STENCIL=1` to preserve depth across GPU scenes.
 
+Build vitaGL with `HAVE_SHADER_CACHE=1` to persist compiled shaders between
+launches. Before creating the Vita sink, the application can call
+`vglSetShaderCachePath()` with its own writable data directory. Use a cache
+namespace tied to the vitaGL/vitaShaRK versions, compiler options and semantic
+binding mode; this backend uses `VGL_MODE_SHADER_PAIR`. vitaGL hashes shader
+sources and creates its vertex/fragment cache subdirectories. An absent entry
+is compiled normally. This avoids repeat compilation stalls, but new shader
+combinations still compile on first use; it does not improve steady-state draw
+throughput or replace framebuffer synchronization.
+
 The interface supports triangles/rectangles, generated color combiners, batched
 draws, VI visibility/gamma/field addressing, and explicit color-image readback.
 Readback returns top-to-bottom bytes in N64 RGBA16/RGBA32 order; integration must
