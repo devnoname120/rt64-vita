@@ -60,6 +60,21 @@ subregions, split load/render tiles and RGBA32 TMEM banks. Later draws cannot
 change an already loaded image. Mixed layouts and format reinterpretations fall
 back to materializing the snapshot through CPU readback.
 
+Ordinary CPU textures use a second-level decoded-image cache across TMEM reloads.
+It retains up to 2 MiB of entry data (TMEM keys and decoded RGBA pixels), plus
+object/container overhead, with
+least-recently-used eviction. Layout and all TMEM bytes must match exactly after
+the hash lookup, including palette mode; framebuffer-backed or mixed TMEM
+bypasses this cache. Images still referenced by draws remain immutable and live
+after eviction. Oversized images are decoded without entering the cache.
+
+TMEM loads validate the complete source span before its conversion to the
+target's pointer size. Ordinary aligned transfers on little-endian hosts use
+word copies with the original row XOR and RGBA32 bank split. Unaligned reads,
+palettes, other byte orders and framebuffer provenance use the byte path.
+Full-span validation removes redundant per-byte source checks. Provenance
+writes are skipped only when no framebuffer references exist.
+
 The GL sink observes changes against a shadow of word-swapped RDRAM. A GPU merge
 preserves untouched framebuffer bytes while replacing changed bytes, including
 partial RGBA16 pixels and RGBA32 alpha. This avoids CPU readback for that merge.

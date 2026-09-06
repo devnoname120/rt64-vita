@@ -2,6 +2,9 @@
 
 namespace RT64 {
 namespace {
+    uint32_t reverseWord(uint32_t value) {
+        return (value<<24)|((value&0xff00U)<<8)|((value>>8)&0xff00U)|(value>>24);
+    }
     std::array<float, 4> unpack(uint32_t color) {
         return {((color >> 24) & 255) / 255.0f, ((color >> 16) & 255) / 255.0f,
             ((color >> 8) & 255) / 255.0f, (color & 255) / 255.0f};
@@ -59,7 +62,12 @@ namespace {
         const bool rgba32 = t.fmt == G_IM_FMT_RGBA && t.siz == G_IM_SIZ_32b;
         const uint32_t mask = rgba32 ? 2047 : 4095, advance = rgba32 ? 4 : 8;
         const uint32_t tmemStride = uint32_t(t.line) << (palette ? 5 : 3);
-        const uint64_t span=uint64_t(rows-1)*stride+uint64_t(words)*(palette?2:8);
+        if(!rows || !words) throw std::invalid_argument("RT64 Fast empty TMEM transfer");
+        const uint64_t rowOffset=uint64_t(rows-1)*stride,rowBytes=uint64_t(words)*(palette?2:8);
+        // Check before adding or narrowing to size_t on the 32-bit target.
+        if(rowOffset>state->rdramSize || rowBytes>state->rdramSize-rowOffset)
+            throw std::out_of_range("RT64 Fast TMEM source span exceeds RDRAM");
+        const uint64_t span=rowOffset+rowBytes;
         state->fromRDRAM(start,span);
         auto framebuffer=state->sink.snapshotFramebuffer(start,uint32_t(span));
         uint32_t load=0;
@@ -71,23 +79,49 @@ namespace {
                 if(entry.second.image==framebuffer && entry.second.bytes) { loadedBytes=entry.second.bytes; break; }
             framebufferLoads.emplace(load,FramebufferLoad{framebuffer,loadedBytes,0});
         }
+        // The whole source span was checked above. RDRAM's size is a multiple
+        // of four, so the byte XOR stays within the supplied memory.
+        // When there are no framebuffer references, their per-byte provenance
+        // is already zero and tmemSource is unused.
+        const bool plainMemory=!load && framebufferLoads.empty();
+        const uint32_t endian=1;
+        const bool wordTransfers=plainMemory && !palette && *reinterpret_cast<const uint8_t *>(&endian)==1;
         uint32_t dxtCounter = 0, swap = 0;
         for (uint32_t row = 0; row < rows; ++row) {
             uint32_t dst = ((uint32_t(t.tmem) << 3) + row * tmemStride) & mask;
             uint32_t src = start + row * stride;
             for (uint32_t word = 0; word < words; ++word) {
-                state->fromRDRAM(src, palette ? 2 : 8);
-                for (unsigned byte = 0; byte < 8; ++byte) {
-                    const uint32_t source=src+(palette?(byte&1):byte);
-                    const uint8_t v=loadedBytes?loadedBytes->at(source-framebuffer->address):state->readU8(source);
-                    uint32_t destination;
-                    if (rgba32) {
-                        const uint32_t bank = (byte & 2) ? 2048 : 0;
-                        const uint32_t offset = (byte / 4) * 2 + (byte & 1);
-                        destination=(((dst+offset)&mask)^swap)|bank;
-                    } else destination=((dst+byte)&mask)^swap;
-                    tmem[destination]=v;
-                    setFramebufferByte(destination,load,source);
+                if(wordTransfers && !(src&3)) {
+                    uint32_t first,second;
+                    std::memcpy(&first,state->RDRAM+src,4);
+                    std::memcpy(&second,state->RDRAM+(src+4),4);
+                    if(rgba32) {
+                        // Split RG and BA into their TMEM banks, then store
+                        // big-endian byte order with the same odd-row XOR.
+                        const uint32_t rg=reverseWord((first&0xffff0000U)|(second>>16));
+                        const uint32_t ba=reverseWord((first<<16)|(second&0xffffU));
+                        const uint32_t at=dst^swap;
+                        std::memcpy(tmem.data()+at,&rg,4);
+                        std::memcpy(tmem.data()+(at|2048),&ba,4);
+                    } else {
+                        first=reverseWord(first); second=reverseWord(second);
+                        const uint32_t at=dst^swap;
+                        std::memcpy(tmem.data()+at,&first,4);
+                        std::memcpy(tmem.data()+(((dst+4)&mask)^swap),&second,4);
+                    }
+                } else {
+                    for (unsigned byte = 0; byte < 8; ++byte) {
+                        const uint32_t source=src+(palette?(byte&1):byte);
+                        const uint8_t v=loadedBytes?loadedBytes->at(source-framebuffer->address):state->RDRAM[source^3];
+                        uint32_t destination;
+                        if (rgba32) {
+                            const uint32_t bank = (byte & 2) ? 2048 : 0;
+                            const uint32_t offset = (byte / 4) * 2 + (byte & 1);
+                            destination=(((dst+offset)&mask)^swap)|bank;
+                        } else destination=((dst+byte)&mask)^swap;
+                        tmem[destination]=v;
+                        if(!plainMemory) setFramebufferByte(destination,load,source);
+                    }
                 }
                 if (block) {
                     dxtCounter += dxt;
@@ -182,12 +216,32 @@ namespace {
         const uint64_t generation = tmemGeneration * 4 + (otherMode.textLUT() >> G_MDSFT_TEXTLUT);
         if (cached && decodedGenerations[tile] == generation) return cached;
         const auto &t = tiles.at(tile);
-        auto out = std::make_shared<FastTexture>();
         const uint32_t tileWidth = ((uint32_t(t.lrs) - t.uls) & 4095) / 4 + 1;
         const uint32_t tileHeight = ((uint32_t(t.lrt) - t.ult) & 4095) / 4 + 1;
-        out->width = t.masks && !(t.cms & G_TX_CLAMP) ? (1U << t.masks) : tileWidth;
-        out->height = t.maskt && !(t.cmt & G_TX_CLAMP) ? (1U << t.maskt) : tileHeight;
-        if (out->width > 1024 || out->height > 1024) throw std::runtime_error("RT64 Fast texture exceeds 1024 texels");
+        const uint32_t width=t.masks && !(t.cms & G_TX_CLAMP) ? (1U << t.masks) : tileWidth;
+        const uint32_t height=t.maskt && !(t.cmt & G_TX_CLAMP) ? (1U << t.maskt) : tileHeight;
+        if (width > 1024 || height > 1024) throw std::runtime_error("RT64 Fast texture exceeds 1024 texels");
+        // Raw TMEM alone cannot identify GPU-backed bytes. Keep framebuffer
+        // views and mixed/materialized loads on the existing provenance path.
+        const bool cacheable=framebufferLoads.empty();
+        const std::array<uint32_t,8> layout={t.fmt,t.siz,t.line,t.tmem,t.palette,width,height,otherMode.textLUT()};
+        uint64_t key=0;
+        if(cacheable) {
+            key=XXH3_64bits_withSeed(tmem.data(),tmem.size(),XXH3_64bits(layout.data(),sizeof(layout)));
+            const auto range=cpuTextureCache.equal_range(key);
+            for(auto it=range.first;it!=range.second;++it) {
+                auto &entry=it->second;
+                // The hash is only an index: exact comparisons prevent a
+                // collision from reusing another image or decode layout.
+                if(entry.layout==layout && entry.memory==tmem) {
+                    entry.used=++cpuTextureCacheClock;
+                    cached=entry.texture; decodedGenerations[tile]=generation;
+                    return cached;
+                }
+            }
+        }
+        auto out = std::make_shared<FastTexture>();
+        out->width=width; out->height=height;
         if(decodeFramebufferView(t,*out)) {
             cached=out; decodedGenerations[tile]=generation; return out;
         }
@@ -224,6 +278,17 @@ namespace {
             std::copy(pixel.begin(), pixel.end(), out->rgba.begin() + (size_t(y) * out->width + x) * 4);
         }
         out->hash = XXH3_64bits(out->rgba.data(), out->rgba.size());
+        const size_t retainedBytes=sizeof(CachedCPUTexture)+out->rgba.size();
+        if(cacheable && retainedBytes<=cpuTextureCacheLimit) {
+            while(cpuTextureCacheBytes+retainedBytes>cpuTextureCacheLimit) {
+                auto oldest=std::min_element(cpuTextureCache.begin(),cpuTextureCache.end(),
+                    [](const auto &a,const auto &b){return a.second.used<b.second.used;});
+                cpuTextureCacheBytes-=sizeof(CachedCPUTexture)+oldest->second.texture->rgba.size();
+                cpuTextureCache.erase(oldest);
+            }
+            cpuTextureCache.emplace(key,CachedCPUTexture{layout,tmem,out,++cpuTextureCacheClock});
+            cpuTextureCacheBytes+=retainedBytes;
+        }
         cached = out; decodedGenerations[tile] = generation;
         return out;
     }

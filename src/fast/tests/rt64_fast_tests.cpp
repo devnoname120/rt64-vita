@@ -49,6 +49,11 @@ namespace {
         std::vector<uint32_t> memory(8192);
         State state(reinterpret_cast<uint8_t *>(memory.data()),memory.size()*4,sink);
         auto &rdp=*state.rdp;
+        // Seed an ordinary image with the same raw TMEM/layout as the next
+        // GPU load. Provenance must prevent reuse of that CPU image.
+        rdp.setTile(0,G_IM_FMT_RGBA,G_IM_SIZ_16b,1,0,0,G_TX_CLAMP,G_TX_CLAMP,0,0,0,0);
+        rdp.setTileSize(0,0,0,12,20); rdp.decodeTexture(0);
+        const auto cpuEntries=rdp.cpuTextureCache.size(),cpuBytes=rdp.cpuTextureCacheBytes;
         sink.configure(2,8);
         rdp.setTextureImage(G_IM_FMT_RGBA,G_IM_SIZ_16b,8,0x1000);
         rdp.setTile(7,G_IM_FMT_RGBA,G_IM_SIZ_16b,1,0,0,G_TX_CLAMP,G_TX_CLAMP,0,0,0,0);
@@ -65,6 +70,8 @@ namespace {
         check(!mixed->storage && sink.reads==1,"mixed framebuffer/RAM tile did not materialize its snapshot");
         check(mixed->rgba[0]==0 && mixed->rgba[1]==255 && mixed->rgba[2]==0,"RAM overwrite was lost");
         check(mixed->rgba[16]==255 && mixed->rgba[17]==0,"untouched framebuffer TMEM was lost");
+        check(rdp.cpuTextureCache.size()==cpuEntries && rdp.cpuTextureCacheBytes==cpuBytes,
+            "GPU-backed or mixed framebuffer bytes entered the CPU texture cache");
         rdp.setTile(1,G_IM_FMT_RGBA,G_IM_SIZ_16b,1,2,0,G_TX_CLAMP,G_TX_CLAMP,0,0,0,0);
         rdp.setTileSize(1,0,0,12,0);
         check(rdp.decodeTexture(1)->storage==view->storage,"materialization destroyed another GPU view");
@@ -259,6 +266,8 @@ namespace {
         f.half(0x1000,0x003f); rdp.loadBlock(7,0,0,15,1024);
         check(rdp.decodeTexture(0)->rgba[2]==255, "TMEM reload kept stale texture");
         check(tile->rgba[0]==255, "previous draw texture was mutated");
+        f.half(0x1000,0xf801); rdp.loadBlock(7,0,0,15,1024);
+        check(rdp.decodeTexture(0)==tile,"identical TMEM reload was decoded again");
         // 32-bit RGBA splits RG and BA into the two TMEM banks.
         for (unsigned i=0;i<16;++i) f.byte(0x2000+i,uint8_t(i*11));
         rdp.setTextureImage(G_IM_FMT_RGBA,G_IM_SIZ_32b,2,0x2000);
@@ -266,6 +275,14 @@ namespace {
         rdp.loadTile(0,0,0,4,4);
         auto rgba = rdp.decodeTexture(0);
         for (unsigned i=0;i<16;++i) check(rgba->rgba[i]==i*11,"RGBA32 bank split/row XOR");
+        const uint32_t end=f.state.rdramSize;
+        f.byte(end-3,0xab); f.byte(end-2,0xcd);
+        rdp.setTextureImage(G_IM_FMT_RGBA,G_IM_SIZ_16b,1,end-3);
+        rdp.setTile(7,G_IM_FMT_RGBA,G_IM_SIZ_16b,0,256,0,0,0,0,0,0,0);
+        rdp.loadTLUT(7,0,0,0,0);
+        for(unsigned i=0;i<8;++i) check(rdp.tmem[2048+i]==(i&1?0xcd:0xab),"unaligned final-word TLUT load changed bytes");
+        rdp.setTextureImage(G_IM_FMT_RGBA,G_IM_SIZ_16b,1,end-1);
+        rejects([&]{rdp.loadTLUT(7,0,0,0,0);},"TMEM load crossed the validated RDRAM boundary");
     }
     void vertexProcessing() {
         Fixture f;
@@ -328,10 +345,108 @@ namespace {
         rdp.setTile(0,G_IM_FMT_YUV,G_IM_SIZ_16b,1,0,0,0,0,0,0,0,0);
         rejects([&]{rdp.decodeTexture(0);},"unsupported YUV texture silently accepted");
     }
+    void decodedTextureCache() {
+        Capture sink;
+        std::vector<uint32_t> memory(2048);
+        State warm(reinterpret_cast<uint8_t *>(memory.data()),memory.size()*4,sink);
+        const unsigned formats[]={G_IM_FMT_I,G_IM_FMT_I,G_IM_FMT_IA,G_IM_FMT_IA,G_IM_FMT_IA,
+            G_IM_FMT_RGBA,G_IM_FMT_RGBA,G_IM_FMT_CI,G_IM_FMT_CI,G_IM_FMT_CI,G_IM_FMT_CI};
+        const unsigned sizes[]={G_IM_SIZ_4b,G_IM_SIZ_8b,G_IM_SIZ_4b,G_IM_SIZ_8b,G_IM_SIZ_16b,
+            G_IM_SIZ_16b,G_IM_SIZ_32b,G_IM_SIZ_4b,G_IM_SIZ_8b,G_IM_SIZ_4b,G_IM_SIZ_8b};
+        auto configure=[&](FastRDP &rdp,unsigned variant) {
+            for(unsigned i=0;i<4096;++i) rdp.tmem[i]=uint8_t((variant%4)*37+i*7+(i>>8));
+            ++rdp.tmemGeneration;
+            rdp.setOtherMode(variant%11>=9?G_TT_IA16:G_TT_RGBA16,0);
+            rdp.setTile(0,formats[variant%11],sizes[variant%11],1+variant%7,variant*11,variant%16,
+                G_TX_CLAMP,variant&1?0:G_TX_CLAMP,0,variant&1?3:0,variant%4,0);
+            rdp.setTileSize(0,4,8,4+(2+variant/11)*4,8+(variant/11)*4);
+        };
+        std::array<std::shared_ptr<const FastTexture>,44> first{};
+        for(unsigned n=0;n<176;++n) {
+            const unsigned variant=(n*13)%44;
+            configure(*warm.rdp,variant);
+            State fresh(reinterpret_cast<uint8_t *>(memory.data()),memory.size()*4,sink);
+            configure(*fresh.rdp,variant);
+            const auto expected=fresh.rdp->decodeTexture(0),actual=warm.rdp->decodeTexture(0);
+            check(actual->width==expected->width && actual->height==expected->height
+                && actual->rgba==expected->rgba && actual->hash==expected->hash,"cached texture differs from a fresh decode");
+            if(first[variant]) check(actual==first[variant],"revisited CPU texture was not reused");
+            else first[variant]=actual;
+        }
+        // Force an index collision, independently for content and layout.
+        // The hash must never be treated as proof that a cached image matches.
+        for(bool changeLayout:{false,true}) {
+            State state(reinterpret_cast<uint8_t *>(memory.data()),memory.size()*4,sink);
+            auto &rdp=*state.rdp;
+            rdp.tmem.fill(0x5b); ++rdp.tmemGeneration;
+            rdp.setTile(0,G_IM_FMT_I,G_IM_SIZ_8b,1,0,0,G_TX_CLAMP,G_TX_CLAMP,0,0,0,0);
+            rdp.setTileSize(0,0,0,4,0);
+            const auto a=rdp.decodeTexture(0);
+            if(changeLayout) rdp.setTile(0,G_IM_FMT_IA,G_IM_SIZ_8b,1,0,0,G_TX_CLAMP,G_TX_CLAMP,0,0,0,0);
+            else { rdp.tmem[0]=0xaa; ++rdp.tmemGeneration; }
+            const auto b=rdp.decodeTexture(0);
+            check(a->rgba!=b->rgba,"collision fixture did not create different images");
+            auto entryB=std::find_if(rdp.cpuTextureCache.begin(),rdp.cpuTextureCache.end(),[&](const auto &e){return e.second.texture==b;});
+            const uint64_t keyB=entryB->first;
+            rdp.cpuTextureCacheBytes-=sizeof(FastRDP::CachedCPUTexture)+b->rgba.size();
+            rdp.cpuTextureCache.erase(entryB);
+            auto node=rdp.cpuTextureCache.extract(rdp.cpuTextureCache.begin());
+            node.key()=keyB; rdp.cpuTextureCache.insert(std::move(node));
+            rdp.decodedTextures[0].reset();
+            const auto retried=rdp.decodeTexture(0);
+            check(retried!=a && retried->rgba==b->rgba,"texture cache accepted a colliding index");
+        }
+        State bounded(reinterpret_cast<uint8_t *>(memory.data()),memory.size()*4,sink);
+        auto &rdp=*bounded.rdp;
+        rdp.setTile(0,G_IM_FMT_I,G_IM_SIZ_8b,1,0,0,G_TX_CLAMP,G_TX_CLAMP,0,0,0,0);
+        rdp.setTileSize(0,0,0,4,4);
+        std::shared_ptr<const FastTexture> retained;
+        for(unsigned n=0;n<700;++n) {
+            rdp.tmem[0]=uint8_t(n); rdp.tmem[1]=uint8_t(n>>8); ++rdp.tmemGeneration;
+            auto image=rdp.decodeTexture(0);
+            check(image->rgba[0]==uint8_t(n),"eviction reused stale texture content");
+            if(!n) retained=image;
+            check(rdp.cpuTextureCacheBytes<=FastRDP::cpuTextureCacheLimit,"CPU texture cache exceeded its budget");
+        }
+        check(rdp.cpuTextureCache.size()<700 && retained->rgba[0]==0,"eviction lost an image still held by a draw");
+        const auto entries=rdp.cpuTextureCache.size(),bytes=rdp.cpuTextureCacheBytes;
+        rdp.setTileSize(0,0,0,4092,2044); // 2 MiB pixels plus its key exceeds the budget.
+        check(rdp.decodeTexture(0)->rgba.size()==2*1024*1024,"large uncached texture was not decoded");
+        check(rdp.cpuTextureCache.size()==entries && rdp.cpuTextureCacheBytes==bytes,"oversized image entered the CPU cache");
+    }
+    void alignedTMEMTransfers() {
+        Fixture f;
+        State reference(f.state.RDRAM,f.state.rdramSize,f.capture);
+        // Equal logical bytes at an aligned and an unaligned source exercise
+        // the word-transfer path and retained byte path independently.
+        for(unsigned variant=0;variant<64;++variant) {
+            const bool rgba32=variant&1,palette=variant&2,block=variant&4;
+            const uint32_t words=1+(variant%9),rows=1+((variant/8)%4),stride=80;
+            const uint32_t span=(rows-1)*stride+words*(palette?2:8);
+            for(unsigned i=0;i<span;++i) {
+                f.byte(0x1000+i,uint8_t(i*11+variant*17));
+                f.byte(0x4001+i,uint8_t(i*11+variant*17));
+            }
+            const unsigned offsets[]={0,255,256,511};
+            const unsigned dxts[]={0,511,1024,4095};
+            auto transfer=[&](FastRDP &rdp,uint32_t source) {
+                rdp.tmem.fill(0x39);
+                rdp.setTile(7,G_IM_FMT_RGBA,rgba32?G_IM_SIZ_32b:G_IM_SIZ_16b,1+variant%3,
+                    offsets[(variant/8)%4],0,0,0,0,0,0,0);
+                rdp.loadTMEM(7,source,stride,words,rows,block,palette,dxts[(variant/16)%4]);
+            };
+            transfer(*f.state.rdp,0x1000); transfer(*reference.rdp,0x4001);
+            check(f.state.rdp->tmem==reference.rdp->tmem,"aligned TMEM transfer differs from byte path");
+        }
+        rejects([&]{f.state.rdp->loadTMEM(7,0,0,1,0,false,false);},"empty TMEM row count accepted");
+        rejects([&]{f.state.rdp->loadTMEM(7,0,0,0,1,false,false);},"empty TMEM word count accepted");
+        rejects([&]{f.state.rdp->loadTMEM(7,0,0,0x20000001U,1,false,false);},"TMEM span narrowed to 32 bits");
+        rejects([&]{f.state.rdp->loadTMEM(7,0,UINT32_MAX,UINT32_MAX,UINT32_MAX,false,false);},"TMEM span overflow accepted");
+    }
 }
 int main(int argc, char **argv) {
     try {
-        memoryAndControlFlow(); matrixStackBounds(); triangleAndFill(); vertexProcessing(); tmemLoads(); paletteAndIntensity(); drawBatching(); shaderProgramKeys(); framebufferTMEM();
+        memoryAndControlFlow(); matrixStackBounds(); triangleAndFill(); vertexProcessing(); tmemLoads(); alignedTMEMTransfers(); paletteAndIntensity(); decodedTextureCache(); drawBatching(); shaderProgramKeys(); framebufferTMEM();
         std::cout << "RT64 Fast: RDRAM, GBI execution, vertices, fill, TMEM tile/block, RGBA32, CI4, cache, batching and rejection tests passed\n";
         if (argc == 2) {
             // Optional real-game microcode check. The ROM is never a test

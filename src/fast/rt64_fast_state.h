@@ -115,6 +115,18 @@ namespace RT64 {
         uint64_t tmemGeneration = 0;
         std::array<std::shared_ptr<FastTexture>, 8> decodedTextures{};
         std::array<uint64_t, 8> decodedGenerations{};
+        struct CachedCPUTexture {
+            std::array<uint32_t,8> layout;
+            std::array<uint8_t,4096> memory;
+            std::shared_ptr<FastTexture> texture;
+            uint64_t used;
+        };
+        // Bound retained TMEM keys and decoded pixels independently of the
+        // GPU texture cache. Live draws can retain their own shared references.
+        static constexpr size_t cpuTextureCacheLimit=2*1024*1024;
+        std::unordered_multimap<uint64_t,CachedCPUTexture> cpuTextureCache;
+        size_t cpuTextureCacheBytes=0;
+        uint64_t cpuTextureCacheClock=0;
         void setFramebufferByte(uint32_t tmemAddress,uint32_t load,uint32_t source);
         bool decodeFramebufferView(const FastTile &tile,FastTexture &texture);
         void materializeFramebufferTMEM(uint32_t load);
