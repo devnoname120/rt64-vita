@@ -40,6 +40,15 @@ synchronize CPU framebuffer consumers and convert the guest's memory byte order.
 Host tests cover readback packing and ranges, but Vita3K's macOS Vulkan surface
 readback is a known validation limitation.
 
+With official Linux ARM64 Vita3K `4074-496939b6`, Vulkan and Mesa 25.2.8 llvmpipe,
+external-host memory mapping returns the exact current pixels from the first
+diagnostic read. Double-buffer mapping returns zero on that first read. The
+same DK64 probe shows blurred pause backgrounds with external-host mapping and
+black captures with double-buffer mapping. This depends on the host-memory Vulkan
+extension and the Linux driver-specific synchronization path; it is not a general
+setting recommendation for other GPUs or macOS. See the
+[controlled inputs, screenshots and limits](https://github.com/devnoname120/Donkey-Kong-64-Recompiled-Vita/blob/dev/vita/docs/VITA_READBACK_VALIDATION.md#external-host-mapping-control).
+
 VI presentation can also create a view from CPU-written RGBA16/32 RAM without a
 prior RDP draw. CPU edits reach subsequent scanouts, and those views do not claim
 GPU ownership. Reads of fully CPU-owned resident ranges return the original RAM
