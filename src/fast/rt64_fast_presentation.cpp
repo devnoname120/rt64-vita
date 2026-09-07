@@ -4,6 +4,7 @@
 namespace RT64 {
     void FastDrawSink::present(const VI &vi) { present(vi.origin); }
     bool FastDrawSink::readFramebuffer(uint32_t,uint32_t,std::vector<uint8_t>&) { return false; }
+    bool FastDrawSink::readDepthFramebuffer(uint32_t,uint32_t,std::vector<uint8_t>&) { return false; }
     void FastDrawSink::setRDRAM(const uint8_t*,size_t) {}
     void FastDrawSink::setMemoryWriteTracking(std::function<void(uint32_t,uint32_t,bool)>) {}
     void FastDrawSink::notifyMemoryWrites(const std::vector<FastMemoryWrite>&) {}

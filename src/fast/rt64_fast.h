@@ -87,6 +87,9 @@ namespace RT64 {
         // or RGBA32), top scanline first. False means the range is not resident;
         // callers should retain the existing RDRAM contents in that case.
         virtual bool readFramebuffer(uint32_t address,uint32_t size,std::vector<uint8_t> &bytes);
+        // Depth queries use N64's compressed 16-bit Z format, not color packing.
+        // The reduced renderer does not reconstruct the RDP's hidden delta-Z bits.
+        virtual bool readDepthFramebuffer(uint32_t address,uint32_t size,std::vector<uint8_t> &bytes);
         // Memory belongs to the state/runtime and must outlive renderer use.
         virtual void setRDRAM(const uint8_t *rdram,size_t size);
         // The callback registers/releases resident color-image ranges with the

@@ -52,6 +52,9 @@ namespace {
         bool readFramebuffer(uint32_t address,uint32_t size,std::vector<uint8_t> &bytes) override {
             flush(); return backend->readFramebuffer(address,size,bytes);
         }
+        bool readDepthFramebuffer(uint32_t address,uint32_t size,std::vector<uint8_t> &bytes) override {
+            flush(); return backend->readDepthFramebuffer(address,size,bytes);
+        }
         void setRDRAM(const uint8_t *rdram,size_t size) override { flush(); backend->setRDRAM(rdram,size); }
         void setMemoryWriteTracking(std::function<void(uint32_t,uint32_t,bool)> watch) override {
             flush(); backend->setMemoryWriteTracking(std::move(watch));

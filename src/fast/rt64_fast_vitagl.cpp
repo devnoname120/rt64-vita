@@ -82,6 +82,10 @@ namespace {
     };
     struct DepthTarget {
         GLuint fbo=0,depth=0,placeholder=0,attachedColor=0;
+        GLuint sampled=0,readFbo=0,readColor=0;
+        uint32_t address=0,width=0,height=0;
+        uint64_t writeVersion=0,readVersion=0;
+        std::vector<uint8_t> readRGBA;
     };
     struct ImagePool {
         std::map<GLuint,GLuint> images;
@@ -173,6 +177,11 @@ namespace {
         GLint blitGamma=-1,blitQuantize=-1;
         GLuint memoryMerge=0,memoryPixels=0,memoryMask=0;
         GLuint depthClearProgram=0;
+        GLuint depthReadProgram=0;
+#ifdef RT64_FAST_VITAGL
+        void *depthReadScratch=nullptr;
+        size_t depthReadCapacity=0;
+#endif
         GLuint aliasProgram=0;
         GLint aliasDestination=-1,aliasSource=-1,aliasOffset=-1,aliasBounds=-1;
         GLint memoryColorBytes=-1;
@@ -497,9 +506,12 @@ void main() {
             }
         }
         DepthTarget &depthTarget(uint32_t address,uint32_t width,uint32_t height) {
+            if(!width || !height || width>1024 || height>1024)
+                throw std::runtime_error("RT64 Fast invalid depth framebuffer dimensions");
             auto &depth=depthTargets[{address,width,height}];
             if(!depth.fbo) {
                 if(depthTargets.size()>16) throw std::runtime_error("RT64 Fast depth image limit exceeded");
+                depth.address=address;depth.width=width;depth.height=height;
                 // vitaGL owns the actual depth allocation in the FBO, not the
                 // renderbuffer handle. Keep one FBO per depth image and switch
                 // its color attachment without reallocating its hidden depth.
@@ -509,10 +521,25 @@ void main() {
                 glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
                 glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+                glGenFramebuffers(1,&depth.fbo); bindDepthTarget(depth,depth.placeholder);
+#ifndef RT64_FAST_VITAGL
+                const char *extensions=reinterpret_cast<const char *>(glGetString(GL_EXTENSIONS));
+                if(extensions && std::strstr(extensions,"GL_OES_depth_texture")) {
+                    glGenTextures(1,&depth.sampled);glBindTexture(GL_TEXTURE_2D,depth.sampled);
+                    glTexImage2D(GL_TEXTURE_2D,0,GL_DEPTH_COMPONENT,width,height,0,GL_DEPTH_COMPONENT,GL_UNSIGNED_INT,nullptr);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_TEXTURE_2D,depth.sampled,0);
+                } else {
+#endif
                 glGenRenderbuffers(1,&depth.depth); glBindRenderbuffer(GL_RENDERBUFFER,depth.depth);
                 glRenderbufferStorage(GL_RENDERBUFFER,GL_DEPTH_COMPONENT16,width,height);
-                glGenFramebuffers(1,&depth.fbo); bindDepthTarget(depth,depth.placeholder);
                 glFramebufferRenderbuffer(GL_FRAMEBUFFER,GL_DEPTH_ATTACHMENT,GL_RENDERBUFFER,depth.depth);
+#ifndef RT64_FAST_VITAGL
+                }
+#endif
                 if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)
                     throw std::runtime_error("RT64 Fast depth framebuffer is incomplete");
                 clearDepthTarget(depth,width,height,{0,0,int(width),int(height)});
@@ -544,6 +571,7 @@ void main() { gl_FragColor = vec4(0.0); }
             }
             vertices(quad);
             if(glGetError()!=GL_NO_ERROR) throw std::runtime_error("RT64 Fast depth clear failed");
+            depth.writeVersion=++contentVersion;
         }
         void destroyDepthTargets() {
             for(auto &entry:depthTargets) {
@@ -551,6 +579,9 @@ void main() { gl_FragColor = vec4(0.0); }
                 if(depth.fbo) glDeleteFramebuffers(1,&depth.fbo);
                 if(depth.depth) glDeleteRenderbuffers(1,&depth.depth);
                 if(depth.placeholder) glDeleteTextures(1,&depth.placeholder);
+                if(depth.sampled) glDeleteTextures(1,&depth.sampled);
+                if(depth.readFbo) glDeleteFramebuffers(1,&depth.readFbo);
+                if(depth.readColor) glDeleteTextures(1,&depth.readColor);
             }
             depthTargets.clear();
         }
@@ -726,6 +757,10 @@ void main() {
             if(memoryPixels) glDeleteTextures(1,&memoryPixels);
             if(memoryMask) glDeleteTextures(1,&memoryMask);
             if(depthClearProgram) glDeleteProgram(depthClearProgram);
+            if(depthReadProgram) glDeleteProgram(depthReadProgram);
+#ifdef RT64_FAST_VITAGL
+            if(depthReadScratch)vglFree(depthReadScratch);
+#endif
             if(aliasProgram) glDeleteProgram(aliasProgram);
         }
         void draw(const FastDraw &d) override {
@@ -791,6 +826,7 @@ void main() {
             GLenum error=glGetError();
             if(error!=GL_NO_ERROR) throw std::runtime_error("RT64 Fast GL draw error "+std::to_string(error));
             destination.writeVersion=destination.syncVersion=destination.lastDraw=++contentVersion;
+            if(d.depthWrite)depthTarget(d.depthAddress,d.width,d.height).writeVersion=contentVersion;
             markDrawnBytes(d); trimTargets(destination);
         }
         void fullSync() override { glFlush(); }
@@ -897,6 +933,138 @@ void main() {
                 return true;
             }
             return readPixels(t.fbo,t.width,t.height,t.colorBytes,offset,size,bytes);
+        }
+        bool readDepthFramebuffer(uint32_t address,uint32_t size,std::vector<uint8_t> &bytes) override {
+            if(!size) { bytes.clear();return true; }
+            const uint64_t end=uint64_t(address)+size;
+            if(end>uint64_t(UINT32_MAX)+1)return false;
+            DepthTarget *found=nullptr;
+            for(auto &entry:depthTargets) {
+                auto &depth=entry.second;
+                if(address>=depth.address && end<=uint64_t(depth.address)+uint64_t(depth.width)*depth.height*2
+                    && (!found || depth.writeVersion>found->writeVersion))found=&depth;
+            }
+            if(!found)return false;
+            auto &depth=*found;
+            if(depth.readVersion!=depth.writeVersion) {
+                if(!depth.readFbo) {
+                    glGenTextures(1,&depth.readColor);glBindTexture(GL_TEXTURE_2D,depth.readColor);
+                    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,depth.width,depth.height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+                    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+                    glGenFramebuffers(1,&depth.readFbo);glBindFramebuffer(GL_FRAMEBUFFER,depth.readFbo);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,depth.readColor,0);
+                    if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)
+                        throw std::runtime_error("RT64 Fast depth readback framebuffer is incomplete");
+                }
+                if(!depthReadProgram) {
+                    depthReadProgram=link(vertexShader,R"(#version 100
+precision highp float;
+varying vec2 vUV;
+uniform sampler2D uDepth;
+uniform vec2 uDepthScale;
+void main() {
+    float value=clamp(texture2D(uDepth,vUV*uDepthScale).r,0.0,1.0)*262143.0;
+    float integral=floor(value);
+    float fraction=value-integral;
+    float odd=integral-floor(integral*0.5)*2.0;
+    float zFixed=integral;
+    if(fraction>0.5 || (fraction==0.5 && odd>0.5))zFixed+=1.0;
+    float high=floor(zFixed/65536.0);
+    float middle=floor((zFixed-high*65536.0)/256.0);
+    float low=zFixed-high*65536.0-middle*256.0;
+    gl_FragColor=vec4(high,middle,low,255.0)/255.0;
+}
+)");
+                    glUseProgram(depthReadProgram);glUniform1i(glGetUniformLocation(depthReadProgram,"uDepth"),0);
+                }
+                glActiveTexture(GL_TEXTURE0);
+                float depthScaleX=1.0f;
+#ifdef RT64_FAST_VITAGL
+                if(!depth.sampled)glGenTextures(1,&depth.sampled);
+                glBindFramebuffer(GL_FRAMEBUFFER,depth.fbo);
+                glBindTexture(GL_TEXTURE_2D,depth.sampled);
+                vglTexImageDepthBuffer(GL_TEXTURE_2D);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+                // The hidden depth surface has a 32-sample row alignment.
+                // Expose that physical width and exclude padding from the UVs.
+                if(depth.width%32) {
+                    SceGxmTexture *texture=vglGetGxmTexture(GL_TEXTURE_2D);
+                    const void *data=sceGxmTextureGetData(texture);
+                    const uint32_t width=(depth.width+31)&~31U;
+                    if(sceGxmTextureInitLinear(texture,data,SCE_GXM_TEXTURE_FORMAT_DF32M,width,depth.height,0)<0)
+                        throw std::runtime_error("RT64 Fast cannot describe the padded depth texture");
+                    depthScaleX=float(depth.width)/width;
+                    sceGxmTextureSetMinFilter(texture,SCE_GXM_TEXTURE_FILTER_POINT);
+                    sceGxmTextureSetMagFilter(texture,SCE_GXM_TEXTURE_FILTER_POINT);
+                    sceGxmTextureSetUAddrMode(texture,SCE_GXM_TEXTURE_ADDR_CLAMP);
+                    sceGxmTextureSetVAddrMode(texture,SCE_GXM_TEXTURE_ADDR_CLAMP);
+                }
+#else
+                if(!depth.sampled)throw std::runtime_error("RT64 Fast depth readback requires GL_OES_depth_texture");
+                glBindTexture(GL_TEXTURE_2D,depth.sampled);
+#endif
+                glBindFramebuffer(GL_FRAMEBUFFER,depth.readFbo);
+                glViewport(0,0,depth.width,depth.height);
+                glDisable(GL_DEPTH_TEST);glDisable(GL_SCISSOR_TEST);glDisable(GL_CULL_FACE);
+                glDisable(GL_BLEND);glDisable(GL_POLYGON_OFFSET_FILL);
+                glUseProgram(depthReadProgram);
+                glUniform2f(glGetUniformLocation(depthReadProgram,"uDepthScale"),depthScaleX,1.0f);
+                const float xy[][2]={{-1,-1},{1,-1},{1,1},{-1,-1},{1,1},{-1,1}};
+                std::vector<FastVertex> quad(6);
+                for(unsigned i=0;i<6;++i) {
+                    quad[i].position[0]=xy[i][0];quad[i].position[1]=xy[i][1];
+                    quad[i].uv[0]=(xy[i][0]+1)/2;quad[i].uv[1]=(xy[i][1]+1)/2;
+                }
+                vertices(quad);
+                // Occlusion queries must observe this depth image even when
+                // color effects opt into vitaGL's delayed-readback speedhack.
+                glFinish();
+                auto &rgba=depth.readRGBA;
+                const size_t byteCount=size_t(depth.width)*depth.height*4;
+                rgba.resize(byteCount);
+#ifdef RT64_FAST_VITAGL
+                if(byteCount>depthReadCapacity) {
+                    void *replacement=vglMemalign(64,byteCount);
+                    if(!replacement)throw std::runtime_error("RT64 Fast depth transfer allocation failed");
+                    if(depthReadScratch)vglFree(depthReadScratch);
+                    depthReadScratch=replacement;depthReadCapacity=byteCount;
+                }
+                // Read a completed transfer, not a render attachment that the
+                // driver may keep GPU-owned or protected until CPU fault handling.
+                vglReadPixels(0,0,depth.width,depth.height,GL_RGBA,GL_UNSIGNED_BYTE,depthReadScratch);
+                if(glGetError()!=GL_NO_ERROR)throw std::runtime_error("RT64 Fast depth transfer failed");
+                const auto *pixels=static_cast<const uint8_t *>(depthReadScratch);
+                std::copy_n(pixels,byteCount,rgba.data());
+#else
+                glPixelStorei(GL_PACK_ALIGNMENT,1);
+                glReadPixels(0,0,depth.width,depth.height,GL_RGBA,GL_UNSIGNED_BYTE,rgba.data());
+                if(glGetError()!=GL_NO_ERROR)throw std::runtime_error("RT64 Fast depth readback failed");
+#endif
+                glBindFramebuffer(GL_FRAMEBUFFER,0);
+                depth.readVersion=depth.writeVersion;
+            }
+            // DK64 normally asks for one pixel. Keep the resolved image cached,
+            // but avoid repacking every pixel while guest execution waits.
+            const uint32_t offset=address-depth.address,first=offset/2,last=(offset+size-1)/2;
+            bytes.resize(size);
+            uint32_t output=0;
+            for(uint32_t pixel=first;pixel<=last;++pixel) {
+                const uint32_t sample=((depth.height-1-pixel/depth.width)*depth.width+pixel%depth.width)*4;
+                const auto *rgba=depth.readRGBA.data()+sample;
+                const uint32_t fixed=(uint32_t(rgba[0])<<16)|(uint32_t(rgba[1])<<8)|rgba[2];
+                unsigned exponent=0;
+                while(exponent<7 && (fixed&(1U<<(17-exponent))))++exponent;
+                const uint16_t packed=(exponent<<13)|(((fixed>>(6-std::min(exponent,6U)))&0x7ff)<<2);
+                if(pixel*2>=offset)bytes[output++]=packed>>8;
+                if(pixel*2+1<offset+size)bytes[output++]=packed;
+            }
+            return true;
         }
         bool readPixels(GLuint fbo,uint32_t width,uint32_t height,uint32_t colorBytes,uint32_t offset,uint32_t size,std::vector<uint8_t> &bytes) {
             const uint64_t end=uint64_t(offset)+size;
