@@ -57,6 +57,11 @@ namespace {
         return program;
     }
     void enabled(GLenum cap, bool value) { if (value) glEnable(cap); else glDisable(cap); }
+    void scissorEnabled(bool value) {
+        // Redundant enables rebuild vitaGL's mask. Query the actual GL state
+        // so blits and external GL users cannot invalidate a private cache.
+        if(bool(glIsEnabled(GL_SCISSOR_TEST))!=value)enabled(GL_SCISSOR_TEST,value);
+    }
     void useDrawProgram(GLuint program) {
 #ifdef RT64_FAST_VITAGL
         // vitaGL dirties every shader constant on every glUseProgram call.
@@ -651,8 +656,10 @@ void main() { gl_FragColor = vec4(0.0); }
         }
         void scissor(const FastDraw &d,bool rectangleBounds=false) {
             const auto bounds=scissorBounds(d,rectangleBounds);
-            glEnable(GL_SCISSOR_TEST);
-            glScissor(bounds[0],int(d.height)-bounds[3],std::max(0,bounds[2]-bounds[0]),std::max(0,bounds[3]-bounds[1]));
+            const GLint desired[]={bounds[0],int(d.height)-bounds[3],std::max(0,bounds[2]-bounds[0]),std::max(0,bounds[3]-bounds[1])};
+            GLint current[4];glGetIntegerv(GL_SCISSOR_BOX,current);
+            if(!std::equal(current,current+4,desired))glScissor(desired[0],desired[1],desired[2],desired[3]);
+            scissorEnabled(true);
         }
         void vertices(const std::vector<FastVertex> &v) {
             glBindBuffer(GL_ARRAY_BUFFER,vbo);

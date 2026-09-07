@@ -99,6 +99,23 @@ namespace {
         address = fromSegmentedMasked(address);
         state->fromRDRAM(address, count * 16);
         if (combinedChanged) specialComputeModelViewProj();
+        std::array<std::array<float,3>,8> localLights{};
+        std::array<float,3> localLookX{},localLookY{};
+        if(count && (geometryMode & G_LIGHTING)) {
+            // These directions are invariant within one vertex load. Keeping
+            // them local avoids invalidation rules across later RSP commands.
+            auto localDirection = [&](const std::array<float,3> &direction) {
+                std::array<float,3> local{};
+                for(unsigned r=0;r<3;++r)for(unsigned c=0;c<3;++c)
+                    local[r]+=modelStack.back()[r][c]*direction[c];
+                normalize(local);
+                return local;
+            };
+            for(unsigned l=0;l<lightCount;++l)localLights[l]=localDirection(lights[l].direction);
+            if(geometryMode & G_TEXTURE_GEN) {
+                localLookX=localDirection(lookAtX);localLookY=localDirection(lookAtY);
+            }
+        }
         for (unsigned i = 0; i < count; ++i) {
             const uint32_t src = address + i * 16;
             auto &v = vertices[first + i];
@@ -117,22 +134,15 @@ namespace {
                 // Match RT64's computeDirLight/computeTextureGen: transform
                 // directions into local space, then normalize the directions.
                 // Normalizing a transformed vertex normal differs under scale.
-                auto localDirection = [&](const std::array<float, 3> &direction) {
-                    std::array<float, 3> local{};
-                    for (unsigned r = 0; r < 3; ++r) for (unsigned c = 0; c < 3; ++c)
-                        local[r] += modelStack.back()[r][c] * direction[c];
-                    normalize(local);
-                    return local;
-                };
                 for (unsigned c = 0; c < 3; ++c) v.color[c] = lights[lightCount].color[c];
                 for (unsigned l = 0; l < lightCount; ++l) {
-                    const float intensity = std::max(0.0f, dot(normal, localDirection(lights[l].direction)));
+                    const float intensity = std::max(0.0f, dot(normal, localLights[l]));
                     for (unsigned c = 0; c < 3; ++c) v.color[c] += intensity * lights[l].color[c];
                 }
                 for (unsigned c = 0; c < 3; ++c) v.color[c] = std::min(v.color[c], 1.0f);
                 if (geometryMode & G_TEXTURE_GEN) {
-                    const float x = std::clamp(dot(normal, localDirection(lookAtX)), -1.0f, 1.0f);
-                    const float y = std::clamp(dot(normal, localDirection(lookAtY)), -1.0f, 1.0f);
+                    const float x = std::clamp(dot(normal, localLookX), -1.0f, 1.0f);
+                    const float y = std::clamp(dot(normal, localLookY), -1.0f, 1.0f);
                     if (geometryMode & G_TEXTURE_GEN_LINEAR) {
                         v.uv[0] = std::acos(-x) * (1024.0f / 3.141592654f) * scaleS;
                         v.uv[1] = std::acos(-y) * (1024.0f / 3.141592654f) * scaleT;
@@ -187,7 +197,8 @@ namespace {
         draw.cullFront = geometryMode & cullFrontMask;
         draw.cullBack = geometryMode & cullBackMask;
         draw.fog = interop::Blender::usesStandardFogCycle(draw.otherMode);
-        draw.vertices.reserve(3);
+        draw.vertices.swap(triangleVertices);
+        draw.vertices.clear();draw.vertices.reserve(3);
         for (auto i : {a, b, c}) {
             auto v = vertices[i];
             const float w = v.position[3];
@@ -202,6 +213,9 @@ namespace {
         if (!(geometryMode & gbi->constants.at(F3DENUM::G_SHADING_SMOOTH)))
             for (auto &v : draw.vertices) std::copy(std::begin(vertices[a].color), std::end(vertices[a].color), v.color);
         state->sink.draw(draw);
+        // Sinks consume or copy a draw before returning; retained draws own
+        // their copies while this allocation can serve the next triangle.
+        draw.vertices.swap(triangleVertices);
     }
     void FastRSP::branchZ(uint32_t address, uint32_t index, uint32_t z, DisplayList **dl) {
         if (index >= vertices.size() || !vertexValid[index]) throw std::runtime_error("RT64 Fast branch uses unloaded vertex");

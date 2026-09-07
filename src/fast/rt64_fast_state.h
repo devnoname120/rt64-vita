@@ -40,6 +40,7 @@ namespace RT64 {
         std::array<FastVertex, 256> vertices{};
         std::array<std::array<float,3>,256> screenPositions{};
         std::array<bool, 256> vertexValid{};
+        std::vector<FastVertex> triangleVertices;
         std::vector<interop::float4x4> modelStack;
         interop::float4x4 projection = interop::float4x4::identity();
         interop::float4x4 combined = interop::float4x4::identity();
