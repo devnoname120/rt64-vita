@@ -10,19 +10,6 @@ namespace RT64 {
         sink.setRDRAM(rdram,size);
     }
     State::~State() = default;
-    uint8_t *State::fromRDRAM(uint32_t address, size_t bytes) const {
-        if (address > rdramSize || bytes > rdramSize - address) {
-            throw std::out_of_range("RT64 Fast RDRAM access outside supplied memory");
-        }
-        return RDRAM + address;
-    }
-    uint8_t State::readU8(uint32_t address) const { return *fromRDRAM(address ^ 3, 1); }
-    uint16_t State::readU16(uint32_t address) const {
-        return (uint16_t(readU8(address)) << 8) | readU8(address + 1);
-    }
-    uint32_t State::readU32(uint32_t address) const {
-        return (uint32_t(readU16(address)) << 16) | readU16(address + 2);
-    }
     void State::pushReturnAddress(DisplayList *dl) {
         if (returnAddressStack.size() >= 32) throw std::runtime_error("RT64 Fast display-list stack overflow");
         returnAddressStack.push_back(dl);

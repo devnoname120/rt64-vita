@@ -1,4 +1,5 @@
 #include "rt64_fast.h"
+#include "rt64_fast_profile.h"
 #include <tuple>
 
 namespace RT64 {
@@ -24,6 +25,12 @@ namespace {
         static constexpr size_t maxVertices=6144;
         std::unique_ptr<FastDrawSink> backend;
         FastDraw pending;
+        bool pendingOverlaps(uint32_t address,uint32_t size) const {
+            if(pending.vertices.empty() || !size)return false;
+            if(pending.width>1024 || pending.height>1024 || (pending.colorBytes!=2 && pending.colorBytes!=4))return true;
+            const uint64_t end=uint64_t(pending.colorAddress)+uint64_t(pending.width)*pending.height*pending.colorBytes;
+            return uint64_t(address)<end && uint64_t(pending.colorAddress)<uint64_t(address)+size;
+        }
         void flush() {
             if(!pending.vertices.empty()) {
                 backend->draw(pending);
@@ -33,13 +40,18 @@ namespace {
     public:
         explicit FastBatchingSink(std::unique_ptr<FastDrawSink> backend) : backend(std::move(backend)) {}
         void draw(const FastDraw &draw) override {
+            RT64_FAST_SCOPE(Batch,draw.vertices.size());
             // Depth clears derive their bounds from the individual rectangle.
             // Empty draws can still create targets in the backend.
             if(draw.clearDepth || draw.vertices.empty() || draw.vertices.size()>maxVertices) {
                 flush(); backend->draw(draw); return;
             }
-            if(!pending.vertices.empty() &&
-                (!sameState(pending,draw) || pending.vertices.size()+draw.vertices.size()>maxVertices)) flush();
+            if(!pending.vertices.empty()) {
+                if(!sameState(pending,draw)) { RT64_FAST_COUNT(StateFlush,1);flush(); }
+                else if(pending.vertices.size()+draw.vertices.size()>maxVertices) {
+                    RT64_FAST_COUNT(CapacityFlush,1);flush();
+                }
+            }
             if(pending.vertices.empty()) {
                 pending=draw;
                 pending.vertices.reserve(maxVertices);
@@ -63,7 +75,13 @@ namespace {
             flush(); backend->notifyMemoryWrites(writes);
         }
         std::shared_ptr<const FastFramebuffer> snapshotFramebuffer(uint32_t address,uint32_t size) override {
+            // An ordinary RAM upload cannot observe queued color writes. Unknown
+            // or resident views retain the barrier, including larger aliases.
+            if(!maySnapshotFramebuffer(address,size))return {};
             flush(); return backend->snapshotFramebuffer(address,size);
+        }
+        bool maySnapshotFramebuffer(uint32_t address,uint32_t size) const override {
+            return pendingOverlaps(address,size) || backend->maySnapshotFramebuffer(address,size);
         }
         bool readFramebufferSnapshot(const FastFramebuffer &snapshot,std::vector<uint8_t> &bytes) override {
             flush(); return backend->readFramebufferSnapshot(snapshot,bytes);

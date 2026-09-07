@@ -50,7 +50,7 @@ namespace RT64 {
         std::array<uint8_t,32> bytes{}; // N64 byte order; one mask bit per byte.
     };
 
-    struct FastDraw {
+    struct FastDrawParameters {
         interop::OtherMode otherMode{};
         interop::ColorCombiner combine{};
         std::array<float, 4> primitive{1, 1, 1, 1}, environment{}, fogColor{}, blendColor{};
@@ -68,6 +68,8 @@ namespace RT64 {
         bool fill = false, clearDepth = false;
         std::array<float, 4> fillColor{};
         std::array<FastTile, 2> tiles{};
+    };
+    struct FastDraw : FastDrawParameters {
         std::array<std::shared_ptr<const FastTexture>, 2> textures{};
         std::vector<FastVertex> vertices;
     };
@@ -101,6 +103,9 @@ namespace RT64 {
         // Compatible TMEM rectangles sample views directly; other layouts can
         // materialize the same captured image through readFramebufferSnapshot.
         virtual std::shared_ptr<const FastFramebuffer> snapshotFramebuffer(uint32_t address,uint32_t size);
+        // False guarantees no resident color image can satisfy this request.
+        // This metadata-only query must not flush draws or change render state.
+        virtual bool maySnapshotFramebuffer(uint32_t address,uint32_t size) const { return true; }
         virtual bool readFramebufferSnapshot(const FastFramebuffer &snapshot,std::vector<uint8_t> &bytes);
     };
 

@@ -1,4 +1,5 @@
 #include "rt64_fast_state.h"
+#include "rt64_fast_profile.h"
 
 namespace RT64 {
 namespace {
@@ -58,6 +59,8 @@ namespace {
     // the runtime's word-swapped RDRAM layout; TMEM itself is byte addressed.
     void FastRDP::loadTMEM(uint8_t tile, uint32_t start, uint32_t stride, uint32_t words,
         uint32_t rows, bool block, bool palette, uint16_t dxt) {
+        RT64_FAST_SCOPE(TMEM,1);
+        RT64_FAST_COUNT(TmemBytes,uint64_t(words)*rows*(palette?2:8));
         const auto &t = tiles.at(tile);
         const bool rgba32 = t.fmt == G_IM_FMT_RGBA && t.siz == G_IM_SIZ_32b;
         const uint32_t mask = rgba32 ? 2047 : 4095, advance = rgba32 ? 4 : 8;
@@ -212,9 +215,16 @@ namespace {
         loadTMEM(tile, start, stride, (lrs >> 2) - (uls >> 2) + 1, (lrt >> 2) - (ult >> 2) + 1, false, true);
     }
     std::shared_ptr<const FastTexture> FastRDP::decodeTexture(uint8_t tile) {
+        return prepareTexture(tile);
+    }
+    const std::shared_ptr<const FastTexture> &FastRDP::prepareTexture(uint8_t tile) {
+        RT64_FAST_SCOPE(Texture,1);
         auto &cached = decodedTextures.at(tile);
         const uint64_t generation = tmemGeneration * 4 + (otherMode.textLUT() >> G_MDSFT_TEXTLUT);
-        if (cached && decodedGenerations[tile] == generation) return cached;
+        if (cached && decodedGenerations[tile] == generation) {
+            RT64_FAST_COUNT(TextureFastHits,1);
+            return cached;
+        }
         const auto &t = tiles.at(tile);
         const uint32_t tileWidth = ((uint32_t(t.lrs) - t.uls) & 4095) / 4 + 1;
         const uint32_t tileHeight = ((uint32_t(t.lrt) - t.ult) & 4095) / 4 + 1;
@@ -234,16 +244,18 @@ namespace {
                 // The hash is only an index: exact comparisons prevent a
                 // collision from reusing another image or decode layout.
                 if(entry.layout==layout && entry.memory==tmem) {
+                    RT64_FAST_COUNT(TextureHits,1);
                     entry.used=++cpuTextureCacheClock;
                     cached=entry.texture; decodedGenerations[tile]=generation;
                     return cached;
                 }
             }
         }
+        RT64_FAST_COUNT(TextureMisses,1);
         auto out = std::make_shared<FastTexture>();
         out->width=width; out->height=height;
         if(decodeFramebufferView(t,*out)) {
-            cached=out; decodedGenerations[tile]=generation; return out;
+            cached=out; decodedGenerations[tile]=generation; return cached;
         }
         out->rgba.resize(size_t(out->width) * out->height * 4);
         auto u16 = [&](uint32_t a) { return uint16_t((uint16_t(readTMEM(a)) << 8) | readTMEM(a+1)); };
@@ -290,7 +302,7 @@ namespace {
             cpuTextureCacheBytes+=retainedBytes;
         }
         cached = out; decodedGenerations[tile] = generation;
-        return out;
+        return cached;
     }
     void FastRDP::setEnvColor(uint32_t color) { parameters.environment = unpack(color); }
     void FastRDP::setPrimColor(uint8_t lodFrac, uint8_t, uint32_t color) {
@@ -315,14 +327,35 @@ namespace {
         parameters.keyCenter[1] = cg / 255.0f; parameters.keyScale[1] = sg / 255.0f;
         parameters.keyCenter[2] = cb / 255.0f; parameters.keyScale[2] = sb / 255.0f;
     }
-    FastDraw FastRDP::makeDraw(uint8_t tile, bool textured) {
-        FastDraw draw = parameters;
+    void FastRDP::prepareDraw(FastDraw &draw,uint8_t tile,bool textured) {
+        RT64_FAST_SCOPE(Prepare,1);
+        // Reusing a draw must not retire its texture ownership or vertex storage
+        // when only the scalar state is refreshed for the next triangle.
+        static_cast<FastDrawParameters &>(draw)=parameters;
         draw.memoryEpoch=state->memoryEpoch;
         draw.otherMode = otherMode;
-        if (textured) for (unsigned i = 0; i < 2; ++i) {
-            const uint8_t index = (tile + i) & 7;
-            draw.tiles[i] = tiles[index];
-            if (draw.combine.usesTexture(otherMode, i, false)) draw.textures[i] = decodeTexture(index);
+        const std::array<uint32_t,4> key={parameters.combine.L,parameters.combine.H,otherMode.L,otherMode.H};
+        if(textured && (!textureUsageValid || textureUsageKey!=key)) {
+            textureUsageMask=0;
+            for(unsigned i=0;i<2;++i)
+                if(draw.combine.usesTexture(otherMode,i,false))textureUsageMask|=1U<<i;
+            textureUsageKey=key;textureUsageValid=true;
+        }
+        for(unsigned i=0;i<2;++i) {
+            if(textured)draw.tiles[i]=tiles[(tile+i)&7];
+            if(textured && (textureUsageMask&(1U<<i)))draw.textures[i]=prepareTexture((tile+i)&7);
+            else draw.textures[i]=parameters.textures[i];
+        }
+    }
+    FastDraw FastRDP::makeDraw(uint8_t tile, bool textured) {
+        RT64_FAST_SCOPE(Prepare,1);
+        FastDraw draw=parameters;
+        draw.memoryEpoch=state->memoryEpoch;
+        draw.otherMode=otherMode;
+        if(textured)for(unsigned i=0;i<2;++i) {
+            const uint8_t index=(tile+i)&7;
+            draw.tiles[i]=tiles[index];
+            if(draw.combine.usesTexture(otherMode,i,false))draw.textures[i]=decodeTexture(index);
         }
         return draw;
     }

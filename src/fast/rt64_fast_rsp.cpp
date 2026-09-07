@@ -1,4 +1,5 @@
 #include "rt64_fast_interpreter.h"
+#include "rt64_fast_profile.h"
 #include "gbi/rt64_f3d.h"
 #include "shared/rt64_blender.h"
 
@@ -95,6 +96,7 @@ namespace {
         }
     }
     void FastRSP::setVertex(uint32_t address, uint32_t count, uint32_t first) {
+        RT64_FAST_SCOPE(Vertex,count);
         if (first > vertices.size() || count > vertices.size() - first) throw std::runtime_error("RT64 Fast vertex range");
         address = fromSegmentedMasked(address);
         state->fromRDRAM(address, count * 16);
@@ -190,14 +192,20 @@ namespace {
         }
     }
     void FastRSP::drawIndexedTri(uint32_t a, uint32_t b, uint32_t c) {
+        RT64_FAST_SCOPE(Triangle,1);
         for (auto i : {a, b, c}) if (i >= vertices.size() || !vertexValid[i]) throw std::runtime_error("RT64 Fast triangle uses unloaded vertex");
-        auto draw = state->rdp->makeDraw(textureTile, textureOn);
+#ifdef RT64_FAST_REFERENCE_DRAW
+        auto draw=state->rdp->makeDraw(textureTile,textureOn);
+        draw.vertices.swap(triangleDraw.vertices);
+#else
+        auto &draw=triangleDraw;
+        state->rdp->prepareDraw(draw,textureTile,textureOn);
+#endif
         draw.depthTest = (geometryMode & 1U) && draw.otherMode.zCmp();
         draw.depthWrite = (geometryMode & 1U) && draw.otherMode.zUpd();
         draw.cullFront = geometryMode & cullFrontMask;
         draw.cullBack = geometryMode & cullBackMask;
         draw.fog = interop::Blender::usesStandardFogCycle(draw.otherMode);
-        draw.vertices.swap(triangleVertices);
         draw.vertices.clear();draw.vertices.reserve(3);
         for (auto i : {a, b, c}) {
             auto v = vertices[i];
@@ -213,9 +221,9 @@ namespace {
         if (!(geometryMode & gbi->constants.at(F3DENUM::G_SHADING_SMOOTH)))
             for (auto &v : draw.vertices) std::copy(std::begin(vertices[a].color), std::end(vertices[a].color), v.color);
         state->sink.draw(draw);
-        // Sinks consume or copy a draw before returning; retained draws own
-        // their copies while this allocation can serve the next triangle.
-        draw.vertices.swap(triangleVertices);
+#ifdef RT64_FAST_REFERENCE_DRAW
+        draw.vertices.swap(triangleDraw.vertices);
+#endif
     }
     void FastRSP::branchZ(uint32_t address, uint32_t index, uint32_t z, DisplayList **dl) {
         if (index >= vertices.size() || !vertexValid[index]) throw std::runtime_error("RT64 Fast branch uses unloaded vertex");

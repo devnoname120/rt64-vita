@@ -1,4 +1,6 @@
 #include "rt64_fast.h"
+#include "rt64_fast_ranges.h"
+#include "rt64_fast_profile.h"
 #include "hle/rt64_vi.h"
 #include "shared/rt64_blender.h"
 #ifdef RT64_FAST_VITAGL
@@ -35,6 +37,7 @@ namespace {
         return shader;
     }
     GLuint link(GLuint vs,const std::string &fragment) {
+        RT64_FAST_SCOPE(Shader,1);
         GLuint fs = 0, program = 0;
         try {
             fs = compile(GL_FRAGMENT_SHADER, fragment);
@@ -200,15 +203,7 @@ namespace {
             return it!=gpuRanges.end() && it->first<end;
         }
         void markGpuBytes(uint64_t begin,uint64_t end) {
-            if(begin>=end) return;
-            auto it=gpuRanges.lower_bound(begin);
-            if(it!=gpuRanges.begin()) {
-                auto previous=std::prev(it);
-                if(previous->second>=end) return;
-                if(previous->second>=begin) { begin=previous->first; it=gpuRanges.erase(previous); }
-            }
-            while(it!=gpuRanges.end() && it->first<=end) { end=std::max(end,it->second); it=gpuRanges.erase(it); }
-            gpuRanges.emplace(begin,end);
+            fastMarkGpuBytes(gpuRanges,begin,end);
         }
         void clearGpuBytes(uint64_t begin,uint64_t end) {
             auto it=gpuRanges.lower_bound(begin);
@@ -226,6 +221,11 @@ namespace {
             bounds[1]=std::clamp(bounds[1],0,int(draw.height)); bounds[3]=std::clamp(bounds[3],0,int(draw.height));
             if(bounds[0]>=bounds[2] || bounds[1]>=bounds[3]) return;
             const uint64_t stride=uint64_t(draw.width)*draw.colorBytes;
+            const uint64_t first=draw.colorAddress+bounds[1]*stride+bounds[0]*draw.colorBytes;
+            const uint64_t last=draw.colorAddress+(bounds[3]-1)*stride+bounds[2]*draw.colorBytes;
+            // A containing interval covers every clipped row, including its gaps.
+            // Avoid a map lookup per row when a prior clear already owns it all.
+            if(fastContainsGpuBytes(gpuRanges,first,last))return;
             if(!bounds[0] && bounds[2]==int(draw.width)) {
                 markGpuBytes(draw.colorAddress+bounds[1]*stride,draw.colorAddress+bounds[3]*stride);
             } else for(int y=bounds[1];y<bounds[3];++y) {
@@ -662,6 +662,9 @@ void main() { gl_FragColor = vec4(0.0); }
             scissorEnabled(true);
         }
         void vertices(const std::vector<FastVertex> &v) {
+            RT64_FAST_SCOPE(Upload,v.size());
+            RT64_FAST_COUNT(UploadBytes,v.size()*sizeof(FastVertex));
+            RT64_FAST_COUNT(GLDraws,1);
             glBindBuffer(GL_ARRAY_BUFFER,vbo);
             glBufferData(GL_ARRAY_BUFFER, v.size()*sizeof(FastVertex), v.data(), GL_STREAM_DRAW);
             const size_t offsets[4]={offsetof(FastVertex,position),offsetof(FastVertex,uv),offsetof(FastVertex,color),offsetof(FastVertex,fog)};
@@ -771,6 +774,7 @@ void main() {
             if(aliasProgram) glDeleteProgram(aliasProgram);
         }
         void draw(const FastDraw &d) override {
+            RT64_FAST_SCOPE(Draw,d.vertices.size());
             if(d.clearDepth) {
                 auto &depth=depthTarget(d.colorAddress,d.width,d.height);
                 clearDepthTarget(depth,d.width,d.height,scissorBounds(d,true));
@@ -789,6 +793,7 @@ void main() {
             const auto key=fastShaderKey(d);
             auto found=programs.find(key);
             if(found==programs.end()) {
+                RT64_FAST_COUNT(ShaderMisses,1);
                 found=programs.emplace(key,makeProgram(vertexShader,fastFragmentShader(d))).first;
 #if defined(RT64_FAST_VALIDATE_UPLOADS)
                 const auto v=d.vertices.empty()?FastVertex{}:d.vertices.front();
@@ -874,6 +879,15 @@ void main() {
             }
             if(begin!=end) clearGpuBytes(begin,end);
         }
+        bool maySnapshotFramebuffer(uint32_t address,uint32_t size) const override {
+            if(!size)return false;
+            const uint64_t end=uint64_t(address)+size;
+            for(const auto &entry:targets) {
+                const auto &target=entry.second;
+                if(target.fbo && address>=target.address && end<=endAddress(target))return true;
+            }
+            return false;
+        }
         std::shared_ptr<const FastFramebuffer> snapshotFramebuffer(uint32_t address,uint32_t size) override {
             auto *found=findTarget(address,size);
             if(!size || !found) return {};
@@ -942,6 +956,8 @@ void main() {
             return readPixels(t.fbo,t.width,t.height,t.colorBytes,offset,size,bytes);
         }
         bool readDepthFramebuffer(uint32_t address,uint32_t size,std::vector<uint8_t> &bytes) override {
+            RT64_FAST_SCOPE(Readback,size);
+            RT64_FAST_COUNT(DepthQuery,1);
             if(!size) { bytes.clear();return true; }
             const uint64_t end=uint64_t(address)+size;
             if(end>uint64_t(UINT32_MAX)+1)return false;
@@ -1117,6 +1133,7 @@ void main() {
             presentTarget(vi.fbAddress(),vi.visible(),vi.gamma(),vi.width,&vi);
         }
         void presentTarget(uint32_t address,bool visible,float gamma,uint32_t width=0,const VI *vi=nullptr) {
+            RT64_FAST_SCOPE(Present,1);
             // The VI origin includes the field's scanline offset (0x280 bytes
             // for a standard 320-wide RGBA16 image). Find the containing color
             // image rather than requiring its base address to equal the origin.

@@ -40,7 +40,7 @@ namespace RT64 {
         std::array<FastVertex, 256> vertices{};
         std::array<std::array<float,3>,256> screenPositions{};
         std::array<bool, 256> vertexValid{};
-        std::vector<FastVertex> triangleVertices;
+        FastDraw triangleDraw;
         std::vector<interop::float4x4> modelStack;
         interop::float4x4 projection = interop::float4x4::identity();
         interop::float4x4 combined = interop::float4x4::identity();
@@ -114,8 +114,11 @@ namespace RT64 {
         uint32_t fillColor = 0;
         float primitiveDepth = 0;
         uint64_t tmemGeneration = 0;
-        std::array<std::shared_ptr<FastTexture>, 8> decodedTextures{};
+        std::array<std::shared_ptr<const FastTexture>, 8> decodedTextures{};
         std::array<uint64_t, 8> decodedGenerations{};
+        std::array<uint32_t,4> textureUsageKey{};
+        uint8_t textureUsageMask=0;
+        bool textureUsageValid=false;
         struct CachedCPUTexture {
             std::array<uint32_t,8> layout;
             std::array<uint8_t,4096> memory;
@@ -162,7 +165,9 @@ namespace RT64 {
             int16_t uls, int16_t ult, int16_t dsdx, int16_t dtdy, bool flip);
         void drawTris(uint32_t count, const float *pos, const float *tc, const float *col, uint8_t tile, uint8_t levels);
         FastDraw makeDraw(uint8_t tile, bool textured);
+        void prepareDraw(FastDraw &draw, uint8_t tile, bool textured);
         std::shared_ptr<const FastTexture> decodeTexture(uint8_t tile);
+        const std::shared_ptr<const FastTexture> &prepareTexture(uint8_t tile);
         void loadTMEM(uint8_t tile, uint32_t start, uint32_t stride, uint32_t words,
             uint32_t rows, bool block, bool palette, uint16_t dxt = 0);
     };
@@ -181,10 +186,18 @@ namespace RT64 {
 
         State(uint8_t *rdram, size_t size, FastDrawSink &sink);
         ~State();
-        uint8_t *fromRDRAM(uint32_t address, size_t bytes = 8) const;
-        uint8_t readU8(uint32_t address) const;
-        uint16_t readU16(uint32_t address) const;
-        uint32_t readU32(uint32_t address) const;
+        uint8_t *fromRDRAM(uint32_t address, size_t bytes = 8) const {
+            if(address>rdramSize || bytes>rdramSize-address)
+                throw std::out_of_range("RT64 Fast RDRAM access outside supplied memory");
+            return RDRAM+address;
+        }
+        uint8_t readU8(uint32_t address) const { return *fromRDRAM(address^3,1); }
+        uint16_t readU16(uint32_t address) const {
+            return (uint16_t(readU8(address))<<8)|readU8(address+1);
+        }
+        uint32_t readU32(uint32_t address) const {
+            return (uint32_t(readU16(address))<<16)|readU16(address+2);
+        }
         void pushReturnAddress(DisplayList *dl);
         DisplayList *popReturnAddress();
         void flush() { sink.flushDraws(); }

@@ -1,10 +1,12 @@
 #include "rt64_fast_interpreter.h"
+#include "rt64_fast_profile.h"
 #include "gbi/rt64_gbi_extended.h"
 
 namespace RT64 {
     void Interpreter::setup(State *value) { state = value; state->ext.interpreter = this; }
 
     void Interpreter::loadUCodeGBI(uint32_t textAddress, uint32_t dataAddress, bool resetFromTask) {
+        RT64_FAST_SCOPE(Interpreter,1);
         textAddress &= 0xfffff8;
         dataAddress &= 0xfffff8;
         // GBIManager probes up to 0x2000 text bytes and 0x1000 data bytes.
@@ -18,6 +20,7 @@ namespace RT64 {
     }
 
     void Interpreter::processDisplayLists(uint32_t address, DisplayList *start, size_t budget) {
+        RT64_FAST_SCOPE(Interpreter,1);
         if (!state || !hleGBI) throw std::logic_error("RT64 Fast interpreter is not initialized");
         if (start != reinterpret_cast<DisplayList *>(state->fromRDRAM(address))) {
             throw std::invalid_argument("RT64 Fast display-list address mismatch");
@@ -26,6 +29,7 @@ namespace RT64 {
         if(!++state->memoryEpoch) ++state->memoryEpoch;
         auto *dl = start;
         while (dl) {
+            RT64_FAST_COUNT(Commands,1);
             if (!budget--) throw std::runtime_error("RT64 Fast display-list command budget exceeded");
             const uintptr_t ptr = reinterpret_cast<uintptr_t>(dl), base = reinterpret_cast<uintptr_t>(state->RDRAM);
             if (ptr < base || ptr - base > UINT32_MAX || ((ptr - base) & 7)) {
