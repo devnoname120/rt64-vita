@@ -76,7 +76,14 @@ void preparation() {
     auto original=retained.textures[0];
     for(unsigned n=0;n<1000;++n)rdp.prepareDraw(draw,0,true);
     check(draw.textures[0]==original && draw.vertices.data()==storage,"Unchanged preparation lost ownership or storage");
+    const auto staleEntry=rdp.cpuTextureCache.begin()->second;
     rdp.tmem[0]=0x33;++rdp.tmemGeneration;
+    // Force the old image into the new hash bucket. Equality must still inspect
+    // all TMEM bytes instead of treating the fingerprint as proof of identity.
+    const uint64_t collisionKey=XXH3_64bits_withSeed(rdp.tmem.data(),rdp.tmem.size(),
+        XXH3_64bits(staleEntry.layout.data(),sizeof(staleEntry.layout)));
+    rdp.cpuTextureCache.emplace(collisionKey,staleEntry);
+    rdp.cpuTextureCacheBytes+=sizeof(staleEntry)+staleEntry.texture->rgba.size();
     rdp.prepareDraw(draw,0,true);
     check(draw.textures[0]!=original && draw.textures[0]->rgba[0]==0x33 && original->rgba[0]==0x55,
         "TMEM mutation changed an already retained draw");

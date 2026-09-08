@@ -841,7 +841,7 @@ void main() {
             if(d.depthWrite)depthTarget(d.depthAddress,d.width,d.height).writeVersion=contentVersion;
             markDrawnBytes(d); trimTargets(destination);
         }
-        void fullSync() override { glFlush(); }
+        void fullSync() override { RT64_FAST_SCOPE(Sync,1); glFlush(); }
         void setRDRAM(const uint8_t *memory,size_t size) override {
             if(memory==rdram && size==rdramSize) return;
             if(!targets.empty() || !depthTargets.empty()) {
@@ -970,6 +970,8 @@ void main() {
             if(!found)return false;
             auto &depth=*found;
             if(depth.readVersion!=depth.writeVersion) {
+                {
+                RT64_FAST_SCOPE(DepthResolve,1);
                 if(!depth.readFbo) {
                     glGenTextures(1,&depth.readColor);glBindTexture(GL_TEXTURE_2D,depth.readColor);
                     glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,depth.width,depth.height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
@@ -1045,9 +1047,15 @@ void main() {
                     quad[i].uv[0]=(xy[i][0]+1)/2;quad[i].uv[1]=(xy[i][1]+1)/2;
                 }
                 vertices(quad);
+                }
                 // Occlusion queries must observe this depth image even when
                 // color effects opt into vitaGL's delayed-readback speedhack.
+                {
+                RT64_FAST_SCOPE(DepthWait,1);
                 glFinish();
+                }
+                {
+                RT64_FAST_SCOPE(DepthTransfer,1);
                 auto &rgba=depth.readRGBA;
                 const size_t byteCount=size_t(depth.width)*depth.height*4;
                 rgba.resize(byteCount);
@@ -1070,6 +1078,7 @@ void main() {
                 if(glGetError()!=GL_NO_ERROR)throw std::runtime_error("RT64 Fast depth readback failed");
 #endif
                 glBindFramebuffer(GL_FRAMEBUFFER,0);
+                }
                 depth.readVersion=depth.writeVersion;
             }
             // DK64 normally asks for one pixel. Keep the resolved image cached,

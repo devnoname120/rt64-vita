@@ -42,6 +42,7 @@ namespace {
         loadMask = gbi->constants.at(F3DENUM::G_MTX_LOAD);
         cullFrontMask = gbi->constants.at(F3DENUM::G_CULL_FRONT);
         cullBackMask = gbi->constants.at(F3DENUM::G_CULL_BACK);
+        smoothShadingMask = gbi->constants.at(F3DENUM::G_SHADING_SMOOTH);
         if (gbi->flags.pointLighting) throw std::runtime_error("RT64 Fast point lighting not implemented");
     }
     uint32_t FastRSP::fromSegmented(uint32_t address) const {
@@ -191,6 +192,20 @@ namespace {
         default: throw std::runtime_error("RT64 Fast unsupported vertex modification");
         }
     }
+    void FastRSP::beginTriangleRun() {
+        if(triangleRun)return;
+        triangleRun=true;triangleRunPrepared=false;
+        triangleDraw.vertices.clear();triangleVertexValid.fill(false);
+    }
+    void FastRSP::endTriangleRun() {
+        if(!triangleRun)return;
+        triangleRun=false;
+        if(!triangleDraw.vertices.empty())state->sink.draw(triangleDraw);
+        triangleDraw.vertices.clear();triangleRunPrepared=false;
+    }
+    void FastRSP::cancelTriangleRun() noexcept {
+        triangleRun=false;triangleRunPrepared=false;triangleDraw.vertices.clear();
+    }
     void FastRSP::drawIndexedTri(uint32_t a, uint32_t b, uint32_t c) {
         RT64_FAST_SCOPE(Triangle,1);
         for (auto i : {a, b, c}) if (i >= vertices.size() || !vertexValid[i]) throw std::runtime_error("RT64 Fast triangle uses unloaded vertex");
@@ -199,15 +214,23 @@ namespace {
         draw.vertices.swap(triangleDraw.vertices);
 #else
         auto &draw=triangleDraw;
-        state->rdp->prepareDraw(draw,textureTile,textureOn);
+        if(!triangleRun || !triangleRunPrepared)state->rdp->prepareDraw(draw,textureTile,textureOn);
 #endif
-        draw.depthTest = (geometryMode & 1U) && draw.otherMode.zCmp();
-        draw.depthWrite = (geometryMode & 1U) && draw.otherMode.zUpd();
-        draw.cullFront = geometryMode & cullFrontMask;
-        draw.cullBack = geometryMode & cullBackMask;
-        draw.fog = interop::Blender::usesStandardFogCycle(draw.otherMode);
-        draw.vertices.clear();draw.vertices.reserve(3);
+        if(!triangleRun || !triangleRunPrepared) {
+            draw.depthTest = (geometryMode & 1U) && draw.otherMode.zCmp();
+            draw.depthWrite = (geometryMode & 1U) && draw.otherMode.zUpd();
+            draw.cullFront = geometryMode & cullFrontMask;
+            draw.cullBack = geometryMode & cullBackMask;
+            draw.fog = interop::Blender::usesStandardFogCycle(draw.otherMode);
+            draw.vertices.clear();draw.vertices.reserve(triangleRun?6144:3);
+            triangleRunPrepared=triangleRun;
+        }
+        if(!triangleRun)draw.vertices.clear();
+        const size_t first=draw.vertices.size();
         for (auto i : {a, b, c}) {
+            if(triangleRun && triangleVertexValid[i]) {
+                draw.vertices.push_back(triangleVertices[i]);continue;
+            }
             auto v = vertices[i];
             const float w = v.position[3];
             // Convert cached N64 screen coordinates to this color image's
@@ -216,11 +239,15 @@ namespace {
             v.position[1] = (1-2*screenPositions[i][1]/draw.height)*w;
             v.position[2] = (2*screenPositions[i][2]-1)*w;
             if (draw.otherMode.zSource() == G_ZS_PRIM) v.position[2] = state->rdp->primitiveDepth * w;
+            if(triangleRun) { triangleVertices[i]=v;triangleVertexValid[i]=true; }
             draw.vertices.push_back(v);
         }
-        if (!(geometryMode & gbi->constants.at(F3DENUM::G_SHADING_SMOOTH)))
-            for (auto &v : draw.vertices) std::copy(std::begin(vertices[a].color), std::end(vertices[a].color), v.color);
-        state->sink.draw(draw);
+        if (!(geometryMode & smoothShadingMask))
+            for (size_t i=first;i<first+3;++i) std::copy(std::begin(vertices[a].color), std::end(vertices[a].color), draw.vertices[i].color);
+        if(!triangleRun || draw.vertices.size()>=6144) {
+            state->sink.draw(draw);
+            if(triangleRun)draw.vertices.clear();
+        }
 #ifdef RT64_FAST_REFERENCE_DRAW
         draw.vertices.swap(triangleDraw.vertices);
 #endif

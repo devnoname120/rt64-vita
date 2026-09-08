@@ -1,5 +1,6 @@
 #include "rt64_fast_state.h"
 #include "rt64_fast_profile.h"
+#include "rt64_fast_texture_memory.h"
 
 namespace RT64 {
 namespace {
@@ -225,6 +226,7 @@ namespace {
             RT64_FAST_COUNT(TextureFastHits,1);
             return cached;
         }
+        RT64_FAST_SCOPE_NAMED(TextureLookup,1,textureLookupScope);
         const auto &t = tiles.at(tile);
         const uint32_t tileWidth = ((uint32_t(t.lrs) - t.uls) & 4095) / 4 + 1;
         const uint32_t tileHeight = ((uint32_t(t.lrt) - t.ult) & 4095) / 4 + 1;
@@ -237,13 +239,21 @@ namespace {
         const std::array<uint32_t,8> layout={t.fmt,t.siz,t.line,t.tmem,t.palette,width,height,otherMode.textLUT()};
         uint64_t key=0;
         if(cacheable) {
-            key=XXH3_64bits_withSeed(tmem.data(),tmem.size(),XXH3_64bits(layout.data(),sizeof(layout)));
+            {
+                RT64_FAST_SCOPE(TextureHash,1);
+                key=XXH3_64bits_withSeed(tmem.data(),tmem.size(),XXH3_64bits(layout.data(),sizeof(layout)));
+            }
             const auto range=cpuTextureCache.equal_range(key);
             for(auto it=range.first;it!=range.second;++it) {
                 auto &entry=it->second;
                 // The hash is only an index: exact comparisons prevent a
                 // collision from reusing another image or decode layout.
-                if(entry.layout==layout && entry.memory==tmem) {
+                bool equal;
+                {
+                    RT64_FAST_SCOPE(TextureCompare,1);
+                    equal=entry.layout==layout && fastTextureMemoryEqual(entry.memory,tmem);
+                }
+                if(equal) {
                     RT64_FAST_COUNT(TextureHits,1);
                     entry.used=++cpuTextureCacheClock;
                     cached=entry.texture; decodedGenerations[tile]=generation;

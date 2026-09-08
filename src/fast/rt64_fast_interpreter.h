@@ -8,6 +8,7 @@ namespace RT64 {
         GBIManager gbiManager;
         GBI *hleGBI = nullptr;
         uint8_t extendedOpCode = 0;
+        bool batchTriangleRuns = true;
         void setup(State *value);
         void loadUCodeGBI(uint32_t textAddress, uint32_t dataAddress, bool resetFromTask);
         // Throws on unsupported commands or invalid RDRAM rather than continuing

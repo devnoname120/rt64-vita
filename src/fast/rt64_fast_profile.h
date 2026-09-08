@@ -2,12 +2,13 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace RT64::FastProfile {
-enum class Stage : size_t { Interpreter, Vertex, Triangle, Prepare, TMEM, Texture, Batch, Draw, Upload, Shader, Readback, Present, Count };
+enum class Stage : size_t { Interpreter, Vertex, Triangle, Prepare, TMEM, Texture, Batch, Draw, Upload, Shader, Readback, Present, DepthResolve, DepthWait, DepthTransfer, Microcode, Sync, TextureLookup, TextureHash, TextureCompare, Count };
 enum class Counter : size_t { Commands, TextureFastHits, TextureHits, TextureMisses, TmemBytes, GLDraws, UploadBytes, StateFlush, CapacityFlush, ShaderMisses, Snapshot, DepthQuery, Count };
 constexpr size_t stageCount=size_t(Stage::Count),counterCount=size_t(Counter::Count);
-inline constexpr const char *stageNames[]={"interpreter","vertex","triangle","prepare","tmem","texture","batch","draw","upload","shader","readback","present"};
+inline constexpr const char *stageNames[]={"interpreter","vertex","triangle","prepare","tmem","texture","batch","draw","upload","shader","readback","present","depth_resolve","depth_wait","depth_transfer","microcode","sync","texture_lookup","texture_hash","texture_compare"};
 inline constexpr const char *counterNames[]={"commands","texture_fast_hits","texture_hits","texture_misses","tmem_bytes","gl_draws","upload_bytes","state_flush","capacity_flush","shader_misses","snapshot","depth_query"};
 struct Stats {
     std::array<uint64_t,stageCount> us{},calls{},items{};
@@ -47,11 +48,30 @@ public:
 inline void count(Counter counter,uint64_t items=1) {
     if(current)current->stats.counters[size_t(counter)]+=items;
 }
+constexpr bool selected(Stage stage) {
+#ifdef RT64_FAST_PROFILE_COARSE
+    return stage!=Stage::Triangle && stage!=Stage::Prepare && stage!=Stage::Texture && stage!=Stage::Batch;
+#else
+    return true;
+#endif
+}
+constexpr bool selected(Counter counter) {
+#ifdef RT64_FAST_PROFILE_COARSE
+    return counter!=Counter::TextureFastHits && counter!=Counter::Commands
+        && counter!=Counter::StateFlush && counter!=Counter::CapacityFlush;
+#else
+    return true;
+#endif
+}
+struct InactiveScope { InactiveScope(Stage,uint64_t) {} };
+template<Stage stage> using SelectedScope=std::conditional_t<selected(stage),Scope,InactiveScope>;
 }
 #ifdef RT64_FAST_PROFILE
-#define RT64_FAST_SCOPE(stage,items) RT64::FastProfile::Scope rt64_profile_scope{RT64::FastProfile::Stage::stage,items}
-#define RT64_FAST_COUNT(counter,items) RT64::FastProfile::count(RT64::FastProfile::Counter::counter,items)
+#define RT64_FAST_SCOPE_NAMED(stage,items,name) RT64::FastProfile::SelectedScope<RT64::FastProfile::Stage::stage> name{RT64::FastProfile::Stage::stage,items}
+#define RT64_FAST_SCOPE(stage,items) RT64_FAST_SCOPE_NAMED(stage,items,rt64_profile_scope)
+#define RT64_FAST_COUNT(counter,items) do { if constexpr(RT64::FastProfile::selected(RT64::FastProfile::Counter::counter)) RT64::FastProfile::count(RT64::FastProfile::Counter::counter,items); } while(false)
 #else
+#define RT64_FAST_SCOPE_NAMED(stage,items,name) ((void)0)
 #define RT64_FAST_SCOPE(stage,items) ((void)0)
 #define RT64_FAST_COUNT(counter,items) ((void)0)
 #endif

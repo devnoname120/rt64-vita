@@ -41,6 +41,10 @@ namespace RT64 {
         std::array<std::array<float,3>,256> screenPositions{};
         std::array<bool, 256> vertexValid{};
         FastDraw triangleDraw;
+        bool triangleRun=false,triangleRunPrepared=false;
+        std::array<FastVertex,256> triangleVertices{};
+        std::array<bool,256> triangleVertexValid{};
+        uint32_t smoothShadingMask=0;
         std::vector<interop::float4x4> modelStack;
         interop::float4x4 projection = interop::float4x4::identity();
         interop::float4x4 combined = interop::float4x4::identity();
@@ -67,6 +71,9 @@ namespace RT64 {
         void setVertex(uint32_t address, uint32_t count, uint32_t first);
         void modifyVertex(uint32_t vertex, uint32_t where, uint32_t value);
         void drawIndexedTri(uint32_t a, uint32_t b, uint32_t c);
+        void beginTriangleRun();
+        void endTriangleRun();
+        void cancelTriangleRun() noexcept;
         void branchZ(uint32_t address, uint32_t vertex, uint32_t z, DisplayList **dl);
         void branchW(uint32_t address, uint32_t vertex, uint32_t w, DisplayList **dl);
         void setGeometryMode(uint32_t bits) { geometryMode |= bits; }
