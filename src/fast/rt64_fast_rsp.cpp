@@ -100,7 +100,14 @@ namespace {
         RT64_FAST_SCOPE(Vertex,count);
         if (first > vertices.size() || count > vertices.size() - first) throw std::runtime_error("RT64 Fast vertex range");
         address = fromSegmentedMasked(address);
-        state->fromRDRAM(address, count * 16);
+        const auto *input=state->fromRDRAM(address,count*16);
+#ifdef RT64_FAST_REFERENCE_VERTEX_INPUT
+        constexpr bool packedInput=false;
+#else
+        const uint32_t endian=1;
+        const bool packedInput=*reinterpret_cast<const uint8_t *>(&endian)==1;
+#endif
+        RT64_FAST_COUNT(VertexBulkRecords,packedInput?count:0);
         if (combinedChanged) specialComputeModelViewProj();
         std::array<std::array<float,3>,8> localLights{};
         std::array<float,3> localLookX{},localLookY{};
@@ -121,19 +128,28 @@ namespace {
         }
         for (unsigned i = 0; i < count; ++i) {
             const uint32_t src = address + i * 16;
+            // The complete record span was checked above. Decode each record
+            // once instead of rechecking every field; all float math stays unchanged.
+            std::array<uint32_t,4> record{};
+            if(packedInput)std::memcpy(record.data(),input+i*16,16);
+            auto u16=[&](unsigned offset)->uint16_t {
+                return packedInput?uint16_t(record[offset/4]>>((offset&2)?0:16)):state->readU16(src+offset);
+            };
+            auto u8=[&](unsigned offset)->uint8_t {
+                return packedInput?uint8_t(record[offset/4]>>(24-(offset&3)*8)):state->readU8(src+offset);
+            };
             auto &v = vertices[first + i];
-            const float p[4] = {float(int16_t(state->readU16(src))), float(int16_t(state->readU16(src + 2))),
-                float(int16_t(state->readU16(src + 4))), 1};
+            const float p[4] = {float(int16_t(u16(0))),float(int16_t(u16(2))),float(int16_t(u16(4))),1};
             for (unsigned c = 0; c < 4; ++c) {
                 v.position[c] = 0;
                 for (unsigned r = 0; r < 4; ++r) v.position[c] += p[r] * combined[r][c];
             }
-            v.uv[0] = int16_t(state->readU16(src + 8)) / 32.0f * scaleS;
-            v.uv[1] = int16_t(state->readU16(src + 10)) / 32.0f * scaleT;
-            for (unsigned c = 0; c < 4; ++c) v.color[c] = state->readU8(src + 12 + c) / 255.0f;
+            v.uv[0] = int16_t(u16(8)) / 32.0f * scaleS;
+            v.uv[1] = int16_t(u16(10)) / 32.0f * scaleT;
+            for (unsigned c = 0; c < 4; ++c) v.color[c] = u8(12+c) / 255.0f;
             if (geometryMode & G_LIGHTING) {
                 std::array<float, 3> normal{};
-                for (unsigned c = 0; c < 3; ++c) normal[c] = int8_t(state->readU8(src + 12 + c)) / 127.0f;
+                for (unsigned c = 0; c < 3; ++c) normal[c] = int8_t(u8(12+c)) / 127.0f;
                 // Match RT64's computeDirLight/computeTextureGen: transform
                 // directions into local space, then normalize the directions.
                 // Normalizing a transformed vertex normal differs under scale.

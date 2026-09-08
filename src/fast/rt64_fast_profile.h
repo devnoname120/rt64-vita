@@ -6,10 +6,12 @@
 
 namespace RT64::FastProfile {
 enum class Stage : size_t { Interpreter, Vertex, Triangle, Prepare, TMEM, Texture, Batch, Draw, Upload, Shader, Readback, Present, DepthResolve, DepthWait, DepthTransfer, Microcode, Sync, TextureLookup, TextureHash, TextureCompare, Count };
-enum class Counter : size_t { Commands, TextureFastHits, TextureHits, TextureMisses, TmemBytes, GLDraws, UploadBytes, StateFlush, CapacityFlush, ShaderMisses, Snapshot, DepthQuery, Count };
+enum class Counter : size_t { Commands, TextureFastHits, TextureHits, TextureMisses, TmemBytes, GLDraws, UploadBytes, StateFlush, CapacityFlush, ShaderMisses, Snapshot, DepthQuery, TmemPlainBlockBytes, TmemPlainTileBytes, TmemPaletteBytes, TmemRgba32Bytes, TmemProvenanceBytes, TmemUnalignedBytes, TmemBulkBytes, VertexBulkRecords, Count };
 constexpr size_t stageCount=size_t(Stage::Count),counterCount=size_t(Counter::Count);
 inline constexpr const char *stageNames[]={"interpreter","vertex","triangle","prepare","tmem","texture","batch","draw","upload","shader","readback","present","depth_resolve","depth_wait","depth_transfer","microcode","sync","texture_lookup","texture_hash","texture_compare"};
-inline constexpr const char *counterNames[]={"commands","texture_fast_hits","texture_hits","texture_misses","tmem_bytes","gl_draws","upload_bytes","state_flush","capacity_flush","shader_misses","snapshot","depth_query"};
+inline constexpr const char *counterNames[]={"commands","texture_fast_hits","texture_hits","texture_misses","tmem_bytes","gl_draws","upload_bytes","state_flush","capacity_flush","shader_misses","snapshot","depth_query","tmem_plain_block_bytes","tmem_plain_tile_bytes","tmem_palette_bytes","tmem_rgba32_bytes","tmem_provenance_bytes","tmem_unaligned_bytes","tmem_bulk_bytes","vertex_bulk_records"};
+static_assert(sizeof(stageNames)/sizeof(*stageNames)==stageCount);
+static_assert(sizeof(counterNames)/sizeof(*counterNames)==counterCount);
 struct Stats {
     std::array<uint64_t,stageCount> us{},calls{},items{};
     std::array<uint64_t,counterCount> counters{};

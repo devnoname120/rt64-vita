@@ -1,11 +1,41 @@
 #include "rt64_fast_state.h"
 #include "rt64_fast_profile.h"
 #include "rt64_fast_texture_memory.h"
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 namespace RT64 {
 namespace {
     uint32_t reverseWord(uint32_t value) {
         return (value<<24)|((value&0xff00U)<<8)|((value>>8)&0xff00U)|(value>>24);
+    }
+    template<bool OddRow>
+    void copyTmemWords(uint8_t *destination,const uint8_t *source,uint32_t words) {
+#if defined(__ARM_NEON)
+        while(words>=8) {
+            const auto a=vld1q_u8(source),b=vld1q_u8(source+16);
+            const auto c=vld1q_u8(source+32),d=vld1q_u8(source+48);
+            vst1q_u8(destination,OddRow?vrev64q_u8(a):vrev32q_u8(a));
+            vst1q_u8(destination+16,OddRow?vrev64q_u8(b):vrev32q_u8(b));
+            vst1q_u8(destination+32,OddRow?vrev64q_u8(c):vrev32q_u8(c));
+            vst1q_u8(destination+48,OddRow?vrev64q_u8(d):vrev32q_u8(d));
+            source+=64;destination+=64;words-=8;
+        }
+        while(words>=2) {
+            const auto value=vld1q_u8(source);
+            vst1q_u8(destination,OddRow?vrev64q_u8(value):vrev32q_u8(value));
+            source+=16;destination+=16;words-=2;
+        }
+#endif
+        while(words--) {
+            uint32_t first,second;
+            std::memcpy(&first,source,4);std::memcpy(&second,source+4,4);
+            first=reverseWord(first);second=reverseWord(second);
+            std::memcpy(destination+(OddRow?4:0),&first,4);
+            std::memcpy(destination+(OddRow?0:4),&second,4);
+            source+=8;destination+=8;
+        }
     }
     std::array<float, 4> unpack(uint32_t color) {
         return {((color >> 24) & 255) / 255.0f, ((color >> 16) & 255) / 255.0f,
@@ -88,8 +118,45 @@ namespace {
         // When there are no framebuffer references, their per-byte provenance
         // is already zero and tmemSource is unused.
         const bool plainMemory=!load && framebufferLoads.empty();
+        if(palette) { RT64_FAST_COUNT(TmemPaletteBytes,uint64_t(words)*rows*2); }
+        else if(plainMemory) {
+            if(block) { RT64_FAST_COUNT(TmemPlainBlockBytes,uint64_t(words)*rows*8); }
+            else { RT64_FAST_COUNT(TmemPlainTileBytes,uint64_t(words)*rows*8); }
+        }
+        if(rgba32) { RT64_FAST_COUNT(TmemRgba32Bytes,uint64_t(words)*rows*(palette?2:8)); }
+        if(!plainMemory) { RT64_FAST_COUNT(TmemProvenanceBytes,uint64_t(words)*rows*(palette?2:8)); }
+        if((start&3) || (rows>1 && (stride&3))) { RT64_FAST_COUNT(TmemUnalignedBytes,uint64_t(words)*rows*(palette?2:8)); }
         const uint32_t endian=1;
         const bool wordTransfers=plainMemory && !palette && *reinterpret_cast<const uint8_t *>(&endian)==1;
+#ifndef RT64_FAST_REFERENCE_TMEM_LOAD
+        if(wordTransfers && !rgba32 && !(start&3) && (rows==1 || !(stride&3))) {
+            RT64_FAST_COUNT(TmemBulkBytes,uint64_t(words)*rows*8);
+            uint32_t fraction=0,parity=0;
+            for(uint32_t row=0;row<rows;++row) {
+                uint32_t dst=((uint32_t(t.tmem)<<3)+row*tmemStride)&4095;
+                uint32_t src=start+row*stride;
+                uint32_t remaining=words;
+                while(remaining) {
+                    // Wraps and DXT transitions are the only permutation boundaries
+                    // in a plain non-RGBA32 load. Never copy across either boundary.
+                    uint32_t count=std::min(remaining,(4096-dst)/8);
+                    if(block && dxt)count=std::min(count,(2048-fraction+dxt-1)/dxt);
+                    if(parity)copyTmemWords<true>(tmem.data()+dst,state->RDRAM+src,count);
+                    else copyTmemWords<false>(tmem.data()+dst,state->RDRAM+src,count);
+                    dst=(dst+count*8)&4095;src+=count*8;remaining-=count;
+                    if(block) {
+                        fraction+=count*dxt;
+                        while(fraction>=2048) {
+                            dst=(dst+tmemStride)&4095;fraction-=2048;parity^=4;
+                        }
+                    }
+                }
+                if(!block)parity^=4;
+            }
+            ++tmemGeneration;
+            return;
+        }
+#endif
         uint32_t dxtCounter = 0, swap = 0;
         for (uint32_t row = 0; row < rows; ++row) {
             uint32_t dst = ((uint32_t(t.tmem) << 3) + row * tmemStride) & mask;
